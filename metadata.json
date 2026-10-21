@@ -1,0 +1,8 @@
+{
+  "name": "CONCILIAÇÃO DE ESTOQUE PAU BRASIL",
+  "description": "Plataforma de acompanhamento de perdas de estoque, equalização (quebras, vales, trocas, faltas), conciliação multi-depósito e inteligência de chamados de inversão de produtos Ambev.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

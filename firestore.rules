@@ -1,0 +1,80 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        (request.auth.token.email != null && request.auth.token.email.lower() == 'armazemguarabira@gmail.com') ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Connection testing
+    match /test/{testId} {
+      allow read, write: if true;
+    }
+
+    // Sincronização de Inversões (preservando exclusões e pares customizados)
+    match /inversoes/{inversaoId} {
+      allow read, write: if true;
+    }
+
+    // Posições de Estoque (Inventário 02.05.02 / 01.11 - Conciliação)
+    match /stockPositions/{positionId} {
+      allow read, write: if true;
+    }
+
+    // Posições de Estoque (02.05.02 - Grade de Estoque)
+    match /gradePositions/{positionId} {
+      allow read, write: if true;
+    }
+
+    // Quebras de Armazém
+    match /quebras/{quebraId} {
+      allow read, write: if true;
+    }
+
+    // Vales de Rota
+    match /vales/{valeId} {
+      allow read, write: if true;
+    }
+
+    // Trocas e Devoluções
+    match /trocas/{trocaId} {
+      allow read, write: if true;
+    }
+
+    // Faltas Mapeadas de Doca
+    match /faltasMapeadas/{faltaId} {
+      allow read, write: if true;
+    }
+
+    // Fechamentos e Conciliações Congeladas
+    match /frozenReconciliations/{reconciliationId} {
+      allow read, write: if true;
+    }
+
+    // Catálogo de Produtos e Metadados
+    match /products/{productId} {
+      allow read, write: if true;
+    }
+
+    // Usuários e Perfis
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // Configurações Gerais do Armazém
+    match /appSettings/{settingId} {
+      allow read, write: if true;
+    }
+  }
+}

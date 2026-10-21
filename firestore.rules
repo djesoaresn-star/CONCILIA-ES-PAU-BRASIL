@@ -22,6 +22,11 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // Snapshots consolidados do sistema (posições de estoque, grade, etc.)
+    match /systemSnapshots/{snapshotId} {
+      allow read, write: if true;
+    }
+
     // Sincronização de Inversões (preservando exclusões e pares customizados)
     match /inversoes/{inversaoId} {
       allow read, write: if true;

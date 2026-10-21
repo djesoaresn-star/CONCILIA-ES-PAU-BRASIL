@@ -241,6 +241,12 @@ export async function saveGradePositionsToFirestore(items: StockPositionItem[]) 
       recontado: !!item.recontado
     }));
 
+    await setDoc(doc(db, 'gradePositions', 'gradePositionsSnapshot'), {
+      items: cleanedItems,
+      totalCount: items.length,
+      atualizadoEm: new Date().toISOString()
+    }, { merge: true });
+
     await setDoc(doc(db, 'systemSnapshots', 'gradePositionsSnapshot'), {
       items: cleanedItems,
       totalCount: items.length,
@@ -258,6 +264,14 @@ export async function loadGradePositionsFromFirestore(): Promise<StockPositionIt
   if (isQuotaExceeded()) return [];
   const path = 'gradePositions';
   try {
+    const gradeSnap = await getDoc(doc(db, 'gradePositions', 'gradePositionsSnapshot')).catch(() => null);
+    if (gradeSnap && gradeSnap.exists()) {
+      const data = gradeSnap.data();
+      if (data && Array.isArray(data.items) && data.items.length > 0) {
+        return data.items as StockPositionItem[];
+      }
+    }
+
     const snapshotDoc = await getDoc(doc(db, 'systemSnapshots', 'gradePositionsSnapshot')).catch(() => null);
     if (snapshotDoc && snapshotDoc.exists()) {
       const data = snapshotDoc.data();

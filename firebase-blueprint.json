@@ -166,6 +166,16 @@
         "atualizadoEm": { "type": "string", "maxLength": 50 }
       },
       "required": ["id", "deposito", "baseMode", "deletedKeys"]
+    },
+    "SystemSnapshot": {
+      "title": "SystemSnapshot",
+      "description": "Snapshot consolidado de posições de estoque ou grade para alta eficiência e redução de leituras",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "totalCount": { "type": "number" },
+        "atualizadoEm": { "type": "string", "maxLength": 50 }
+      }
     }
   },
   "firestore": {
@@ -180,6 +190,10 @@
     "/gradePositions/{positionId}": {
       "schema": "StockPosition",
       "description": "Coleção de itens de posição de estoque da Grade de Estoque"
+    },
+    "/systemSnapshots/{snapshotId}": {
+      "schema": "SystemSnapshot",
+      "description": "Coleção de snapshots consolidados do sistema"
     },
     "/quebras/{quebraId}": {
       "schema": "Quebra",
@@ -200,6 +214,14 @@
     "/frozenReconciliations/{reconciliationId}": {
       "schema": "FrozenReconciliation",
       "description": "Coleção de fechamentos de conciliação diária congeladas"
+    },
+    "/products/{productId}": {
+      "schema": "StockPosition",
+      "description": "Coleção de produtos e catálogo mestre"
+    },
+    "/appSettings/{settingId}": {
+      "schema": "StockPosition",
+      "description": "Coleção de configurações gerais do armazém"
     },
     "/users/{userId}": {
       "schema": "UserProfile",

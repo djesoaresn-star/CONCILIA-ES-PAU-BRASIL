@@ -77,6 +77,34 @@ function codeDataPersistencePlugin(): Plugin {
   };
 }
 
+// Ensure critical files exist even on a clean checkout where gitignored or omitted
+try {
+  const firebaseConfigPath = path.resolve(__dirname, 'firebase-applet-config.json');
+  if (!fs.existsSync(firebaseConfigPath)) {
+    fs.writeFileSync(
+      firebaseConfigPath,
+      JSON.stringify({
+        projectId: 'scenic-year-l5xj8',
+        appId: '1:862135242756:web:b6290e172729242cece551',
+        apiKey: 'AIzaSyBbQj9D_CKy0cup8OfEWCo3Gc7BeXL2Opc',
+        authDomain: 'scenic-year-l5xj8.firebaseapp.com',
+        firestoreDatabaseId: 'ai-studio-conciliaodeestoq-3b77108f-dfc6-4120-9722-24391951064c',
+        storageBucket: 'scenic-year-l5xj8.firebasestorage.app',
+        messagingSenderId: '862135242756'
+      }, null, 2),
+      'utf-8'
+    );
+  }
+} catch {}
+
+try {
+  const persistedDataPath = path.resolve(__dirname, 'src/data/persistedCodeData.json');
+  if (!fs.existsSync(persistedDataPath)) {
+    fs.mkdirSync(path.dirname(persistedDataPath), { recursive: true });
+    fs.writeFileSync(persistedDataPath, JSON.stringify({}), 'utf-8');
+  }
+} catch {}
+
 export default defineConfig(() => {
   return {
     base: './',
@@ -87,6 +115,30 @@ export default defineConfig(() => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
+      },
+    },
+    build: {
+      chunkSizeWarningLimit: 3000,
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules/xlsx') || id.includes('node_modules/exceljs')) {
+              return 'excel-vendor';
+            }
+            if (id.includes('node_modules/jspdf') || id.includes('node_modules/html2canvas')) {
+              return 'pdf-vendor';
+            }
+            if (id.includes('node_modules/firebase')) {
+              return 'firebase-vendor';
+            }
+            if (id.includes('node_modules/react') || id.includes('node_modules/react-dom') || id.includes('node_modules/motion')) {
+              return 'react-vendor';
+            }
+            if (id.includes('node_modules/recharts')) {
+              return 'charts-vendor';
+            }
+          },
+        },
       },
     },
     server: {

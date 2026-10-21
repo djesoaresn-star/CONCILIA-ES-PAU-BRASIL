@@ -31,9 +31,11 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: npm install --include=dev --legacy-peer-deps
 
       - name: Build Vite App
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
         run: npm run build
 
       - name: Setup Pages

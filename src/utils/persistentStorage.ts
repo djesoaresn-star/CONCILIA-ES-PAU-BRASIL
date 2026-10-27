@@ -6,6 +6,27 @@
 
 import persistedCodeData from '../data/persistedCodeData.json';
 
+export type SyncDatasetKey =
+  | 'stockPositions'
+  | 'gradePositions'
+  | 'quebras'
+  | 'vales'
+  | 'trocas'
+  | 'faltasMapeadas'
+  | 'frozenReconciliations'
+  | 'products'
+  | 'weeklyBillingStatus'
+  | 'users';
+
+export interface DatasetSyncStamp {
+  updatedAt: number;
+  count: number;
+  clientId: string;
+  isExplicitEmpty?: boolean;
+}
+
+export type WorkspaceSyncMeta = Partial<Record<SyncDatasetKey, DatasetSyncStamp>>;
+
 const DB_NAME = 'GestaoEstoqueDB_v1';
 const DB_VERSION = 1;
 const STORE_NAME = 'app_state';
@@ -63,6 +84,13 @@ export interface CompactStockItem {
   ir: string;
   r?: number;
   a?: string;
+  cm?: number;
+  vu?: number;
+  vc?: number;
+  f?: number;
+  hl?: number;
+  desc?: string;
+  g?: string;
 }
 
 export function compressStockPositions(items: any[]): CompactStockItem[] {
@@ -73,7 +101,14 @@ export function compressStockPositions(items: any[]): CompactStockItem[] {
     dr: String(item.disponivelRaw || '0/00'),
     ir: String(item.inventarioRaw || '0/00'),
     r: item.recontado ? 1 : 0,
-    a: item.armazem || '01'
+    a: item.armazem || '01',
+    cm: item.custoMedio ? Number(item.custoMedio) : undefined,
+    vu: item.valorUnitario ? Number(item.valorUnitario) : undefined,
+    vc: item.valorCaixa ? Number(item.valorCaixa) : undefined,
+    f: item.fatorSku ? Number(item.fatorSku) : undefined,
+    hl: item.fatorHl ? Number(item.fatorHl) : undefined,
+    desc: item.descricao || undefined,
+    g: item.grupo || undefined,
   }));
 }
 
@@ -220,11 +255,17 @@ export async function retrieveData<T>(key: string, defaultValue: T): Promise<T> 
             id: `${c.d || '01'}-${c.p}`,
             deposito: c.d || '01',
             produto: c.p,
-            descricao: `Produto ${c.p}`,
+            descricao: c.desc || `Produto ${c.p}`,
             disponivelRaw: c.dr || '0/00',
             inventarioRaw: c.ir || '0/00',
             recontado: Boolean(c.r),
-            armazem: c.a || '01'
+            armazem: c.a || '01',
+            custoMedio: c.cm || 0,
+            valorUnitario: c.vu || 0,
+            valorCaixa: c.vc || 0,
+            fatorSku: c.f || 1,
+            fatorHl: c.hl || 0,
+            grupo: c.g || 'GERAL',
           })) as unknown as T;
           memoryCache.set(key, reconstructed);
           persistData(key, reconstructed).catch(() => {});
@@ -242,11 +283,17 @@ export async function retrieveData<T>(key: string, defaultValue: T): Promise<T> 
             id: `${c.d || '01'}-${c.p}`,
             deposito: c.d || '01',
             produto: c.p,
-            descricao: `Produto ${c.p}`,
+            descricao: c.desc || `Produto ${c.p}`,
             disponivelRaw: c.dr || '0/00',
             inventarioRaw: c.ir || '0/00',
             recontado: Boolean(c.r),
-            armazem: c.a || '01'
+            armazem: c.a || '01',
+            custoMedio: c.cm || 0,
+            valorUnitario: c.vu || 0,
+            valorCaixa: c.vc || 0,
+            fatorSku: c.f || 1,
+            fatorHl: c.hl || 0,
+            grupo: c.g || 'GERAL',
           })) as unknown as T;
           memoryCache.set(key, reconstructed);
           persistData(key, reconstructed).catch(() => {});
@@ -258,29 +305,42 @@ export async function retrieveData<T>(key: string, defaultValue: T): Promise<T> 
 
   // 5. Code Storage Fallback (persisted in codebase JSON)
   try {
+    const codeData: any = persistedCodeData || {};
     if (key === STORAGE_KEYS.STOCK_POSITIONS_020502 || key === STORAGE_KEYS.STOCK_POSITIONS_LEGACY) {
-      if (Array.isArray(persistedCodeData.stockPositions) && persistedCodeData.stockPositions.length > 0) {
-        return persistedCodeData.stockPositions as unknown as T;
+      if (Array.isArray(codeData.stockPositions) && codeData.stockPositions.length > 0) {
+        return codeData.stockPositions as unknown as T;
       }
     } else if (key === STORAGE_KEYS.GRADE_POSITIONS || key === STORAGE_KEYS.GRADE_POSITIONS_LEGACY) {
-      if (Array.isArray(persistedCodeData.gradeStockPositions) && persistedCodeData.gradeStockPositions.length > 0) {
-        return persistedCodeData.gradeStockPositions as unknown as T;
+      if (Array.isArray(codeData.gradeStockPositions) && codeData.gradeStockPositions.length > 0) {
+        return codeData.gradeStockPositions as unknown as T;
       }
     } else if (key === STORAGE_KEYS.QUEBRAS) {
-      if (Array.isArray(persistedCodeData.quebras) && persistedCodeData.quebras.length > 0) {
-        return persistedCodeData.quebras as unknown as T;
+      if (Array.isArray(codeData.quebras) && codeData.quebras.length > 0) {
+        return codeData.quebras as unknown as T;
       }
     } else if (key === STORAGE_KEYS.VALES) {
-      if (Array.isArray(persistedCodeData.vales) && persistedCodeData.vales.length > 0) {
-        return persistedCodeData.vales as unknown as T;
+      if (Array.isArray(codeData.vales) && codeData.vales.length > 0) {
+        return codeData.vales as unknown as T;
       }
     } else if (key === STORAGE_KEYS.TROCAS || key === STORAGE_KEYS.TROCAS_V4) {
-      if (Array.isArray(persistedCodeData.trocas) && persistedCodeData.trocas.length > 0) {
-        return persistedCodeData.trocas as unknown as T;
+      if (Array.isArray(codeData.trocas) && codeData.trocas.length > 0) {
+        return codeData.trocas as unknown as T;
       }
     } else if (key === STORAGE_KEYS.FALTAS) {
-      if (Array.isArray(persistedCodeData.faltasMapeadas) && persistedCodeData.faltasMapeadas.length > 0) {
-        return persistedCodeData.faltasMapeadas as unknown as T;
+      if (Array.isArray(codeData.faltasMapeadas) && codeData.faltasMapeadas.length > 0) {
+        return codeData.faltasMapeadas as unknown as T;
+      }
+    } else if (key === STORAGE_KEYS.FROZEN) {
+      if (Array.isArray(codeData.frozenReconciliations) && codeData.frozenReconciliations.length > 0) {
+        return codeData.frozenReconciliations as unknown as T;
+      }
+    } else if (key === STORAGE_KEYS.PRODUCTS) {
+      if (Array.isArray(codeData.products) && codeData.products.length > 0) {
+        return codeData.products as unknown as T;
+      }
+    } else if (key === STORAGE_KEYS.WEEKLY_BILLING) {
+      if (codeData.weeklyBillingStatus && typeof codeData.weeklyBillingStatus === 'object') {
+        return codeData.weeklyBillingStatus as unknown as T;
       }
     }
   } catch {}
@@ -322,11 +382,17 @@ export function retrieveSync<T>(key: string, defaultValue: T): T {
             id: `${c.d || '01'}-${c.p}`,
             deposito: c.d || '01',
             produto: c.p,
-            descricao: `Produto ${c.p}`,
+            descricao: c.desc || `Produto ${c.p}`,
             disponivelRaw: c.dr || '0/00',
             inventarioRaw: c.ir || '0/00',
             recontado: Boolean(c.r),
-            armazem: c.a || '01'
+            armazem: c.a || '01',
+            custoMedio: c.cm || 0,
+            valorUnitario: c.vu || 0,
+            valorCaixa: c.vc || 0,
+            fatorSku: c.f || 1,
+            fatorHl: c.hl || 0,
+            grupo: c.g || 'GERAL',
           })) as unknown as T;
           memoryCache.set(key, reconstructed);
           return reconstructed;
@@ -343,11 +409,17 @@ export function retrieveSync<T>(key: string, defaultValue: T): T {
             id: `${c.d || '01'}-${c.p}`,
             deposito: c.d || '01',
             produto: c.p,
-            descricao: `Produto ${c.p}`,
+            descricao: c.desc || `Produto ${c.p}`,
             disponivelRaw: c.dr || '0/00',
             inventarioRaw: c.ir || '0/00',
             recontado: Boolean(c.r),
-            armazem: c.a || '01'
+            armazem: c.a || '01',
+            custoMedio: c.cm || 0,
+            valorUnitario: c.vu || 0,
+            valorCaixa: c.vc || 0,
+            fatorSku: c.f || 1,
+            fatorHl: c.hl || 0,
+            grupo: c.g || 'GERAL',
           })) as unknown as T;
           memoryCache.set(key, reconstructed);
           return reconstructed;
@@ -358,29 +430,42 @@ export function retrieveSync<T>(key: string, defaultValue: T): T {
 
   // Code Storage fallback
   try {
+    const codeData: any = persistedCodeData || {};
     if (key === STORAGE_KEYS.STOCK_POSITIONS_020502 || key === STORAGE_KEYS.STOCK_POSITIONS_LEGACY) {
-      if (Array.isArray(persistedCodeData.stockPositions) && persistedCodeData.stockPositions.length > 0) {
-        return persistedCodeData.stockPositions as unknown as T;
+      if (Array.isArray(codeData.stockPositions) && codeData.stockPositions.length > 0) {
+        return codeData.stockPositions as unknown as T;
       }
     } else if (key === STORAGE_KEYS.GRADE_POSITIONS || key === STORAGE_KEYS.GRADE_POSITIONS_LEGACY) {
-      if (Array.isArray(persistedCodeData.gradeStockPositions) && persistedCodeData.gradeStockPositions.length > 0) {
-        return persistedCodeData.gradeStockPositions as unknown as T;
+      if (Array.isArray(codeData.gradeStockPositions) && codeData.gradeStockPositions.length > 0) {
+        return codeData.gradeStockPositions as unknown as T;
       }
     } else if (key === STORAGE_KEYS.QUEBRAS) {
-      if (Array.isArray(persistedCodeData.quebras) && persistedCodeData.quebras.length > 0) {
-        return persistedCodeData.quebras as unknown as T;
+      if (Array.isArray(codeData.quebras) && codeData.quebras.length > 0) {
+        return codeData.quebras as unknown as T;
       }
     } else if (key === STORAGE_KEYS.VALES) {
-      if (Array.isArray(persistedCodeData.vales) && persistedCodeData.vales.length > 0) {
-        return persistedCodeData.vales as unknown as T;
+      if (Array.isArray(codeData.vales) && codeData.vales.length > 0) {
+        return codeData.vales as unknown as T;
       }
     } else if (key === STORAGE_KEYS.TROCAS || key === STORAGE_KEYS.TROCAS_V4) {
-      if (Array.isArray(persistedCodeData.trocas) && persistedCodeData.trocas.length > 0) {
-        return persistedCodeData.trocas as unknown as T;
+      if (Array.isArray(codeData.trocas) && codeData.trocas.length > 0) {
+        return codeData.trocas as unknown as T;
       }
     } else if (key === STORAGE_KEYS.FALTAS) {
-      if (Array.isArray(persistedCodeData.faltasMapeadas) && persistedCodeData.faltasMapeadas.length > 0) {
-        return persistedCodeData.faltasMapeadas as unknown as T;
+      if (Array.isArray(codeData.faltasMapeadas) && codeData.faltasMapeadas.length > 0) {
+        return codeData.faltasMapeadas as unknown as T;
+      }
+    } else if (key === STORAGE_KEYS.FROZEN) {
+      if (Array.isArray(codeData.frozenReconciliations) && codeData.frozenReconciliations.length > 0) {
+        return codeData.frozenReconciliations as unknown as T;
+      }
+    } else if (key === STORAGE_KEYS.PRODUCTS) {
+      if (Array.isArray(codeData.products) && codeData.products.length > 0) {
+        return codeData.products as unknown as T;
+      }
+    } else if (key === STORAGE_KEYS.WEEKLY_BILLING) {
+      if (codeData.weeklyBillingStatus && typeof codeData.weeklyBillingStatus === 'object') {
+        return codeData.weeklyBillingStatus as unknown as T;
       }
     }
   } catch {}
@@ -440,4 +525,66 @@ export const STORAGE_KEYS = {
   ACTIVE_USER: 'gestao_estoque_v3_usuario_ativo',
   USERS: 'gestao_estoque_v3_usuarios',
   PRODUCTS: 'gestao_estoque_v3_produtos',
+  SYNC_META: 'gestao_estoque_v5_sync_meta',
+  CLIENT_ID: 'gestao_estoque_v5_client_id',
 };
+
+export function getOrCreateClientId(): string {
+  try {
+    const existing = localStorage.getItem(STORAGE_KEYS.CLIENT_ID);
+    if (existing) return existing;
+    const generated = `client_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    safeLocalStorageSet(STORAGE_KEYS.CLIENT_ID, generated);
+    return generated;
+  } catch {
+    return 'client_session';
+  }
+}
+
+export function getLocalSyncMeta(): WorkspaceSyncMeta {
+  try {
+    if (memoryCache.has(STORAGE_KEYS.SYNC_META)) {
+      return (memoryCache.get(STORAGE_KEYS.SYNC_META) || {}) as WorkspaceSyncMeta;
+    }
+    const raw = localStorage.getItem(STORAGE_KEYS.SYNC_META);
+    if (raw) {
+      const parsed = JSON.parse(raw) as WorkspaceSyncMeta;
+      memoryCache.set(STORAGE_KEYS.SYNC_META, parsed);
+      return parsed;
+    }
+    const codeData: any = persistedCodeData || {};
+    if (codeData.syncMeta && typeof codeData.syncMeta === 'object') {
+      return codeData.syncMeta as WorkspaceSyncMeta;
+    }
+  } catch {}
+  return {};
+}
+
+export function setLocalDatasetStamp(dataset: SyncDatasetKey, stamp: DatasetSyncStamp): WorkspaceSyncMeta {
+  const current = getLocalSyncMeta();
+  const next: WorkspaceSyncMeta = {
+    ...current,
+    [dataset]: stamp,
+  };
+  memoryCache.set(STORAGE_KEYS.SYNC_META, next);
+  safeLocalStorageSet(STORAGE_KEYS.SYNC_META, JSON.stringify(next));
+  persistData(STORAGE_KEYS.SYNC_META, next).catch(() => {});
+  return next;
+}
+
+export function markLocalDatasetMutation(
+  dataset: SyncDatasetKey,
+  count: number,
+  isExplicitEmpty: boolean = false,
+  customTimestamp?: number
+): DatasetSyncStamp {
+  const stamp: DatasetSyncStamp = {
+    updatedAt: customTimestamp ?? Date.now(),
+    count,
+    clientId: getOrCreateClientId(),
+    isExplicitEmpty: isExplicitEmpty || undefined,
+  };
+  setLocalDatasetStamp(dataset, stamp);
+  return stamp;
+}
+

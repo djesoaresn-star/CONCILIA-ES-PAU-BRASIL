@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   CalendarDays, 
   Search, 
@@ -30,6 +30,8 @@ import {
 import { DEPOSITOS } from '../data/initialData';
 import { INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026 } from '../data/initialFrozenData';
 import { roundSkuDown, formatSkuInteger } from './DifMensalView';
+import { reconcileAllStock, ReconciliationMode } from '../utils/reconciliationEngine';
+import { normalizeSku } from '../utils/parsers';
 
 interface DifDiariaViewProps {
   stockPositions: StockPositionItem[];
@@ -43,6 +45,9 @@ interface DifDiariaViewProps {
   frozenReconciliations: FrozenReconciliation[];
   onOpenSaveModal: () => void;
   onNavigateTab?: (tab: ViewTab) => void;
+  weeklyBillingStatus?: Record<string, 'PENDENTE' | 'OK'>;
+  reconciliationMode?: ReconciliationMode;
+  onChangeReconciliationMode?: (mode: ReconciliationMode) => void;
 }
 
 interface DiariaRow {
@@ -78,16 +83,35 @@ interface DiariaRow {
 
 export const DifDiariaView: React.FC<DifDiariaViewProps> = ({
   stockPositions,
+  quebras = [],
+  vales = [],
+  trocas = [],
+  faltasMapeadas = [],
   selectedDeposito,
   setSelectedDeposito,
   productsMap,
   frozenReconciliations,
   onOpenSaveModal,
-  onNavigateTab
+  onNavigateTab,
+  weeklyBillingStatus,
+  reconciliationMode,
+  onChangeReconciliationMode,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [filterMode, setFilterMode] = useState<'all' | 'variation' | 'faltas' | 'sobras'>('all');
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string>('latest');
+  const [comparisonMode, setComparisonMode] = useState<ReconciliationMode>(reconciliationMode || 'com_ajuste');
+
+  useEffect(() => {
+    if (reconciliationMode) {
+      setComparisonMode(reconciliationMode);
+    }
+  }, [reconciliationMode]);
+
+  const handleModeChange = (mode: ReconciliationMode) => {
+    setComparisonMode(mode);
+    onChangeReconciliationMode?.(mode);
+  };
 
   // Seleciona a reconciliação congelada de referência
   const referenceFrozen = useMemo(() => {
@@ -96,105 +120,179 @@ export const DifDiariaView: React.FC<DifDiariaViewProps> = ({
     return frozenReconciliations.find(f => f.id === selectedSnapshotId) || frozenReconciliations[0];
   }, [frozenReconciliations, selectedSnapshotId]);
 
-  // Mapa de itens congelados para consulta rápida
+  // Verifica se há arquivo 02.05.02 carregado atualmente na plataforma (conciliação)
+  const hasCurrent020502 = Boolean(stockPositions && stockPositions.length > 0);
+
+  // Motor Único Canônico de Conciliação (mesmos cálculos do Dashboard e da Conciliação)
+  const reconciledCurrent = useMemo(() => {
+    if (!hasCurrent020502) return null;
+    return reconcileAllStock({
+      stockPositions,
+      quebras,
+      vales,
+      trocas,
+      faltasMapeadas,
+      selectedDeposito,
+      weeklyBillingStatus,
+      productsMap,
+    });
+  }, [
+    hasCurrent020502,
+    stockPositions,
+    quebras,
+    vales,
+    trocas,
+    faltasMapeadas,
+    selectedDeposito,
+    weeklyBillingStatus,
+    productsMap,
+  ]);
+
+  // Mapa de itens congelados filtrado por depósito e acumulado na mesma modalidade (Com Ajustes vs Sem Ajuste)
   const frozenItemsMap = useMemo(() => {
-    const map = new Map<string, { qtd: number; valor: number }>();
+    const map = new Map<string, { qtd: number; valor: number; descricao?: string; valorCaixa?: number; fatorSku?: number }>();
+
+    const accumulate = (
+      rawSku: string,
+      qtd: number,
+      valor: number,
+      meta?: { descricao?: string; valorCaixa?: number; fatorSku?: number }
+    ) => {
+      const sku = normalizeSku(String(rawSku || ''));
+      if (!sku) return;
+      const existing = map.get(sku);
+      if (existing) {
+        existing.qtd += qtd;
+        existing.valor += valor;
+      } else {
+        map.set(sku, {
+          qtd,
+          valor,
+          descricao: meta?.descricao,
+          valorCaixa: meta?.valorCaixa,
+          fatorSku: meta?.fatorSku,
+        });
+      }
+    };
 
     if (referenceFrozen) {
-      if (referenceFrozen.itensComAjustes && referenceFrozen.itensComAjustes.length > 0) {
+      const hasComAjustes = Boolean(referenceFrozen.itensComAjustes && referenceFrozen.itensComAjustes.length > 0);
+      const hasSemAjustes = Boolean(referenceFrozen.itensSemAjustes && referenceFrozen.itensSemAjustes.length > 0);
+      const useComAjustes = comparisonMode === 'com_ajuste' ? hasComAjustes : !hasSemAjustes;
+
+      if (useComAjustes && referenceFrozen.itensComAjustes) {
         referenceFrozen.itensComAjustes.forEach(item => {
-          map.set(String(item.produto), {
-            qtd: item.divergenciaResidualSkus || 0,
-            valor: item.impactoFinanceiroResidual || 0
-          });
+          if (selectedDeposito !== 'ALL' && item.deposito && item.deposito !== selectedDeposito) return;
+          accumulate(
+            String(item.produto),
+            item.divergenciaResidualSkus || 0,
+            item.impactoFinanceiroResidual || 0,
+            { descricao: item.descricao, valorCaixa: item.valorCaixa, fatorSku: item.fatorSku }
+          );
         });
-      } else if (referenceFrozen.itensSemAjustes && referenceFrozen.itensSemAjustes.length > 0) {
+      } else if (referenceFrozen.itensSemAjustes) {
         referenceFrozen.itensSemAjustes.forEach(item => {
-          map.set(String(item.produto), {
-            qtd: item.diferencaSkus || 0,
-            valor: item.impactoFinanceiro || 0
-          });
+          if (selectedDeposito !== 'ALL' && item.deposito && item.deposito !== selectedDeposito) return;
+          if (item.saldoNegativoDesconsiderado || item.disponivelTotalUnits < 0) return;
+          accumulate(
+            String(item.produto),
+            item.diferencaSkus || 0,
+            item.impactoFinanceiro || 0,
+            { descricao: item.descricao, valorCaixa: item.valorCaixa, fatorSku: item.fatorSku }
+          );
         });
       }
     } else {
-      // Fallback para os dados pré-carregados caso ainda não haja reconciliação congelada
+      // Fallback apenas quando ainda não há nenhuma reconciliação congelada salva
       INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026.forEach(item => {
         const qtdDia16 = item.dias[16] ?? item.fechamento;
-        map.set(item.sku, {
-          qtd: qtdDia16,
-          valor: qtdDia16 * item.valorCaixa
+        accumulate(item.sku, qtdDia16, qtdDia16 * item.valorCaixa, {
+          descricao: item.descricao,
+          valorCaixa: item.valorCaixa,
+          fatorSku: item.fatorSku,
         });
       });
     }
 
     return map;
-  }, [referenceFrozen]);
+  }, [referenceFrozen, comparisonMode, selectedDeposito]);
 
-  // Verifica se há arquivo 02.05.02 carregado atualmente na plataforma (conciliação)
-  const hasCurrent020502 = Boolean(stockPositions && stockPositions.length > 0);
-
-  // Mapa de divergência do dia atual (a partir das posições ativas da 02.05.02 na conciliação)
+  // Mapa de divergência do dia atual pelo Motor Único (100% igual ao Dashboard e Conciliação)
   const diaAtualMap = useMemo(() => {
-    const map = new Map<string, { qtd: number; valor: number }>();
+    const map = new Map<string, { qtd: number; valor: number; descricao: string; grupo: string; fatorSku: number; fatorHl: number; valorCaixa: number; valorUnitario: number }>();
 
-    // REGRA DE NEGÓCIO: Não pode haver dif atual se não há nenhum arquivo 02.05.02 na conciliação
-    if (!hasCurrent020502) {
+    if (!hasCurrent020502 || !reconciledCurrent) {
       return map;
     }
 
-    const filteredPositions = selectedDeposito === 'ALL'
-      ? stockPositions
-      : stockPositions.filter(s => s.deposito === selectedDeposito);
+    reconciledCurrent.rows.forEach(row => {
+      const sku = normalizeSku(String(row.stockItem.produto || ''));
+      if (!sku) return;
+      const qtd = row.isIgnoredNegative
+        ? 0
+        : comparisonMode === 'com_ajuste'
+          ? (row.adjustedItem.divergenciaResidualSkus || 0)
+          : (row.stockItem.diferencaSkus || 0);
+      const val = row.isIgnoredNegative
+        ? 0
+        : comparisonMode === 'com_ajuste'
+          ? (row.adjustedItem.impactoFinanceiroResidual || 0)
+          : (row.stockItem.impactoFinanceiro || 0);
 
-    filteredPositions.forEach(s => {
-      const existing = map.get(s.produto);
-      const qtd = s.diferencaSkus || 0;
-      const val = s.impactoFinanceiro || 0;
+      const existing = map.get(sku);
       if (existing) {
         existing.qtd += qtd;
         existing.valor += val;
       } else {
-        map.set(s.produto, { qtd, valor: val });
+        map.set(sku, {
+          qtd,
+          valor: val,
+          descricao: row.stockItem.descricao,
+          grupo: row.stockItem.grupo || 'GERAL',
+          fatorSku: row.stockItem.fatorSku,
+          fatorHl: row.stockItem.fatorHl,
+          valorCaixa: row.stockItem.valorCaixa,
+          valorUnitario: row.stockItem.valorUnitario,
+        });
       }
     });
 
     return map;
-  }, [stockPositions, selectedDeposito, hasCurrent020502]);
+  }, [hasCurrent020502, reconciledCurrent, comparisonMode]);
 
   // Constrói todas as linhas comparativas combinando SKUs conhecidos
   const rows: DiariaRow[] = useMemo(() => {
-    // Reúne todos os SKUs relevantes
     const skusSet = new Set<string>();
 
     frozenItemsMap.forEach((_, sku) => skusSet.add(sku));
     if (hasCurrent020502) {
       diaAtualMap.forEach((_, sku) => skusSet.add(sku));
     }
-    INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026.forEach(i => skusSet.add(i.sku));
-
-    // Se tiver produtos no cadastro, inclui os com movimentação
-    productsMap.forEach((_, sku) => {
-      if (frozenItemsMap.has(sku) || (hasCurrent020502 && diaAtualMap.has(sku))) {
-        skusSet.add(sku);
-      }
-    });
+    if (!referenceFrozen) {
+      INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026.forEach(i => skusSet.add(normalizeSku(i.sku)));
+    }
 
     const list: DiariaRow[] = [];
 
     skusSet.forEach(sku => {
-      const prod = productsMap.get(sku);
-      const initialItem = INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026.find(i => i.sku === sku);
-
-      const descricao = prod?.descricao || initialItem?.descricao || `PRODUTO ${sku}`;
-      const grupo = prod?.grupo || initialItem?.grupo || 'GERAL';
-      const fatorSku = prod?.fatorSku || initialItem?.fatorSku || 12;
-      const fatorHl = prod?.fatorHl || initialItem?.fatorHl || 0.04;
-      const valorCaixa = prod?.valorCaixa || prod?.valor || initialItem?.valorCaixa || 30.00;
-      const valorUnitario = prod?.valorUnitario || prod?.valorUnit || initialItem?.valorUnitario || (valorCaixa / fatorSku);
-
-      // Congelado (último congelamento)
+      const atualMeta = diaAtualMap.get(sku);
       const frozenData = frozenItemsMap.get(sku);
-      const rawCongeladaQtd = frozenData ? frozenData.qtd : (initialItem?.dias[16] ?? initialItem?.fechamento ?? 0);
+      const prod = productsMap.get(sku);
+      const initialItem = !referenceFrozen
+        ? INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026.find(i => normalizeSku(i.sku) === sku)
+        : undefined;
+
+      const descricao = atualMeta?.descricao || frozenData?.descricao || prod?.descricao || initialItem?.descricao || `PRODUTO ${sku}`;
+      const grupo = atualMeta?.grupo || prod?.grupo || initialItem?.grupo || 'GERAL';
+      const fatorSku = atualMeta?.fatorSku || frozenData?.fatorSku || prod?.fatorSku || initialItem?.fatorSku || 12;
+      const fatorHl = atualMeta?.fatorHl || prod?.fatorHl || initialItem?.fatorHl || 0.04;
+      const valorCaixa = atualMeta?.valorCaixa || frozenData?.valorCaixa || prod?.valorCaixa || prod?.valor || initialItem?.valorCaixa || 30.00;
+      const valorUnitario = atualMeta?.valorUnitario || prod?.valorUnitario || prod?.valorUnit || initialItem?.valorUnitario || (valorCaixa / Math.max(1, fatorSku));
+
+      // Congelado (último congelamento real; só usa Setembro se não houver congelamento salvo)
+      const rawCongeladaQtd = frozenData
+        ? frozenData.qtd
+        : (initialItem ? (initialItem.dias[16] ?? initialItem.fechamento ?? 0) : 0);
       const congeladaQtd = roundSkuDown(rawCongeladaQtd);
       const congeladaValor = frozenData ? frozenData.valor : (congeladaQtd * valorCaixa);
 
@@ -270,7 +368,7 @@ export const DifDiariaView: React.FC<DifDiariaViewProps> = ({
       if (!aHasVar && bHasVar) return 1;
       return Number(a.sku) - Number(b.sku);
     });
-  }, [frozenItemsMap, diaAtualMap, productsMap, hasCurrent020502]);
+  }, [frozenItemsMap, diaAtualMap, productsMap, hasCurrent020502, referenceFrozen]);
 
   // Filtros aplicados
   const filteredRows = useMemo(() => {
@@ -575,6 +673,32 @@ export const DifDiariaView: React.FC<DifDiariaViewProps> = ({
             >
               <span className="w-2 h-2 rounded-full bg-blue-500"></span>
               <span>Sobras ({rows.filter(r => r.statusColor === 'azul').length})</span>
+            </button>
+          </div>
+
+          {/* Segmented Mode Selector: Sem Ajuste | Com Ajustes */}
+          <div className="inline-flex items-center p-0.5 rounded-lg bg-slate-100 border border-slate-200">
+            <button
+              type="button"
+              onClick={() => handleModeChange('sem_ajuste')}
+              className={`px-3 py-1 rounded-md text-xs font-bold transition cursor-pointer ${
+                comparisonMode === 'sem_ajuste'
+                  ? 'bg-white text-slate-900 shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Sem Ajuste
+            </button>
+            <button
+              type="button"
+              onClick={() => handleModeChange('com_ajuste')}
+              className={`px-3 py-1 rounded-md text-xs font-bold transition cursor-pointer ${
+                comparisonMode === 'com_ajuste'
+                  ? 'bg-emerald-600 text-white shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Com Ajustes
             </button>
           </div>
 

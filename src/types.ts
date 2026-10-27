@@ -273,6 +273,7 @@ export interface ItemConciliacaoAjustada {
 
   finalRaw: string;
   finalTotalUnits: number;
+  finalUnits?: number;
   finalSkus: number;
   valorFinal: number;
 

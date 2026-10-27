@@ -26,13 +26,23 @@ import {
   parseValesCsv, 
   parseTrocasCsv, 
   parseFaltasCsv,
-  parseExcelWorkbookToCsv 
+  parseExcelWorkbookToCsv,
+  calcularDivergencia
 } from '../utils/parsers';
 import { sanitizeAndDeduplicateQuebras, ensureCompleteHistoricalQuebras } from '../utils/quebrasDeduplicator';
 import { DEPOSITOS } from '../data/initialData';
-import { persistData, safeLocalStorageSet, STORAGE_KEYS, compressStockPositions } from '../utils/persistentStorage';
+import { persistData, safeLocalStorageSet, STORAGE_KEYS, compressStockPositions, markLocalDatasetMutation, getLocalSyncMeta } from '../utils/persistentStorage';
 import { parseBatchDesviosWorkbook, downloadBatchDesviosExcelTemplate } from '../utils/batchDesviosParser';
 import { saveToCodeStorage } from '../services/codeStorageService';
+import {
+  saveStockPositionsToFirestore,
+  saveGradePositionsToFirestore,
+  saveProductsToFirestore,
+  saveQuebrasToFirestore,
+  saveValesToFirestore,
+  saveTrocasToFirestore,
+  saveFaltasToFirestore,
+} from '../services/firebaseSyncService';
 
 export type { ImportFileType };
 
@@ -293,10 +303,16 @@ export const ImportModal: React.FC<ImportModalProps> = ({
         safeLocalStorageSet(STORAGE_KEYS.STOCK_POSITIONS_020502, JSON.stringify(merged));
         safeLocalStorageSet(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, JSON.stringify(merged));
 
+        const nowTs = Date.now();
+        markLocalDatasetMutation('stockPositions', merged.length, false, nowTs);
+        saveStockPositionsToFirestore(merged, { updatedAt: nowTs }).catch(() => {});
+
         // 3. Atualiza e substitui também na GUIA DE GRADE DE ESTOQUE (substituição integral)
+        let syncedGrade = merged;
         if (setGradeStockPositions) {
           const parsedForGrade = parse020502Csv(csvContent, productsMap);
           const validGrade = parsedForGrade.length > 0 ? parsedForGrade : merged;
+          syncedGrade = validGrade;
           setGradeStockPositions(validGrade);
           const nowStr = new Date().toLocaleString('pt-BR');
           const fileLabel = uploadedFileName ? `${uploadedFileName} (${nowStr})` : `02.05.02 (${nowStr})`;
@@ -306,13 +322,16 @@ export const ImportModal: React.FC<ImportModalProps> = ({
           const compactGrade = compressStockPositions(validGrade);
           safeLocalStorageSet(STORAGE_KEYS.GRADE_POSITIONS_COMPACT, JSON.stringify(compactGrade));
           safeLocalStorageSet(STORAGE_KEYS.GRADE_POSITIONS, JSON.stringify(validGrade));
+          markLocalDatasetMutation('gradePositions', validGrade.length, false, nowTs);
+          saveGradePositionsToFirestore(validGrade, { updatedAt: nowTs }).catch(() => {});
         }
 
-        // 4. Grava diretamente no código da aplicação (persistedCodeData.json)
+        // 4. Grava na persistência local + código (quando em DEV)
         saveToCodeStorage({
           type: '020502',
           stockPositions: merged,
-          gradeStockPositions: merged
+          gradeStockPositions: syncedGrade,
+          syncMeta: getLocalSyncMeta(),
         });
 
         let toastText = `Sucesso! Base 02.05.02 importada e gravada no código (${parsed.length} itens válidos apurados).`;
@@ -336,7 +355,10 @@ export const ImportModal: React.FC<ImportModalProps> = ({
         const activeDep: DepositoId = targetDeposito === 'ALL' ? '01' : targetDeposito;
         setStockPositions(prev => {
           const updated = apply021101Recounts(prev, recounts, activeDep);
-          saveToCodeStorage({ type: '020502', stockPositions: updated });
+          const nowTs = Date.now();
+          markLocalDatasetMutation('stockPositions', updated.length, false, nowTs);
+          saveStockPositionsToFirestore(updated, { updatedAt: nowTs }).catch(() => {});
+          saveToCodeStorage({ type: '020502', stockPositions: updated, syncMeta: getLocalSyncMeta() });
           return updated;
         });
         setIsRecountApplied(true);
@@ -378,55 +400,81 @@ export const ImportModal: React.FC<ImportModalProps> = ({
         });
 
         setProductsMap(newProductsMap);
-        persistData(STORAGE_KEYS.PRODUCTS, Array.from(newProductsMap.entries()));
+        const productEntries = Array.from(newProductsMap.entries());
+        const prodTs = Date.now();
+        persistData(STORAGE_KEYS.PRODUCTS, productEntries);
+        markLocalDatasetMutation('products', productEntries.length, false, prodTs);
+        saveProductsToFirestore(Array.from(newProductsMap.values()), { updatedAt: prodTs }).catch(() => {});
+        saveToCodeStorage({ type: 'products', products: productEntries, syncMeta: getLocalSyncMeta() });
 
-        // Recalcula impactos financeiros em estoque com os novos preços
+        // Recalcula impactos financeiros em estoque mantendo estritamente a regra de SKU Fechado Promax e identidade de custo
+        const recalcPositionWithCatalog = (item: StockPositionItem): StockPositionItem => {
+          const p = newProductsMap.get(item.produto) as ProductMaster | undefined;
+          if (!p) return item;
+          const importedProd = parsedMap.get(item.produto);
+          const importedHasExplicitPrice = Boolean(importedProd && (importedProd.valor > 0 || importedProd.valorUnit > 0));
+          const fatorSku = Math.max(1, p.fatorSku > 0 ? p.fatorSku : (item.fatorSku || 1));
+          const fatorHl = p.fatorHl > 0 ? p.fatorHl : (item.fatorHl || 0);
+
+          let valorUnitario = item.valorUnitario;
+          let valorCaixa = item.valorCaixa;
+          let custoMedio = item.custoMedio;
+
+          if (importedHasExplicitPrice) {
+            valorCaixa = p.valor > 0 ? p.valor : (p.valorUnit * fatorSku);
+            valorUnitario = valorCaixa / fatorSku;
+            custoMedio = valorUnitario;
+          } else if (item.custoMedio && item.custoMedio > 0) {
+            valorUnitario = item.custoMedio;
+            valorCaixa = valorUnitario * fatorSku;
+          } else {
+            valorCaixa = p.valor > 0 ? p.valor : ((p.valorUnit || item.valorUnitario) * fatorSku);
+            valorUnitario = valorCaixa / fatorSku;
+          }
+
+          const div = calcularDivergencia(
+            item.disponivelRaw,
+            item.inventarioRaw,
+            fatorSku,
+            valorUnitario,
+            fatorHl
+          );
+
+          return {
+            ...item,
+            descricao: p.descricao || item.descricao,
+            grupo: p.grupo || item.grupo,
+            fatorSku,
+            fatorHl,
+            custoMedio,
+            valorUnitario,
+            valorCaixa,
+            ...div,
+          };
+        };
+
         setStockPositions(prev => {
-          const updated = prev.map(item => {
-            const p = newProductsMap.get(item.produto) as ProductMaster | undefined;
-            if (!p) return item;
-            const valorUnitario = p.valorUnit || item.valorUnitario;
-            const valorCaixa = p.valor || (valorUnitario * item.fatorSku);
-            const impactoFinanceiro = item.diferencaTotalUnits * valorUnitario;
-            const prejuizoFinanceiro = item.diferencaTotalUnits < 0 ? Math.abs(item.diferencaTotalUnits * valorUnitario) : 0;
-            const sobraFinanceira = item.diferencaTotalUnits > 0 ? item.diferencaTotalUnits * valorUnitario : 0;
-            return {
-              ...item,
-              valorUnitario,
-              valorCaixa,
-              impactoFinanceiro,
-              prejuizoFinanceiro,
-              sobraFinanceira,
-            };
-          });
+          const updated = prev.map(recalcPositionWithCatalog);
           persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, updated);
           persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, updated);
-          saveToCodeStorage({ type: '020502', stockPositions: updated });
+          if (updated.length > 0) {
+            markLocalDatasetMutation('stockPositions', updated.length, false, prodTs);
+            saveStockPositionsToFirestore(updated, { updatedAt: prodTs }).catch(() => {});
+          }
+          saveToCodeStorage({ type: '020502', stockPositions: updated, syncMeta: getLocalSyncMeta() });
           return updated;
         });
 
         if (setGradeStockPositions) {
           setGradeStockPositions(prev => {
-            const updated = prev.map(item => {
-              const p = newProductsMap.get(item.produto) as ProductMaster | undefined;
-              if (!p) return item;
-              const valorUnitario = p.valorUnit || item.valorUnitario;
-              const valorCaixa = p.valor || (valorUnitario * item.fatorSku);
-              const impactoFinanceiro = item.diferencaTotalUnits * valorUnitario;
-              const prejuizoFinanceiro = item.diferencaTotalUnits < 0 ? Math.abs(item.diferencaTotalUnits * valorUnitario) : 0;
-              const sobraFinanceira = item.diferencaTotalUnits > 0 ? item.diferencaTotalUnits * valorUnitario : 0;
-              return {
-                ...item,
-                valorUnitario,
-                valorCaixa,
-                impactoFinanceiro,
-                prejuizoFinanceiro,
-                sobraFinanceira,
-              };
-            });
+            const updated = prev.map(recalcPositionWithCatalog);
             persistData(STORAGE_KEYS.GRADE_POSITIONS, updated);
             persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, updated);
-            saveToCodeStorage({ type: 'grade', gradeStockPositions: updated });
+            if (updated.length > 0) {
+              markLocalDatasetMutation('gradePositions', updated.length, false, prodTs);
+              saveGradePositionsToFirestore(updated, { updatedAt: prodTs }).catch(() => {});
+            }
+            saveToCodeStorage({ type: 'grade', gradeStockPositions: updated, syncMeta: getLocalSyncMeta() });
             return updated;
           });
         }
@@ -481,11 +529,14 @@ export const ImportModal: React.FC<ImportModalProps> = ({
 
           const guaranteed = ensureCompleteHistoricalQuebras(updated);
           const { cleaned } = sanitizeAndDeduplicateQuebras(guaranteed);
+          const nowTs = Date.now();
           persistData(STORAGE_KEYS.QUEBRAS, cleaned);
           try {
             localStorage.setItem('gestao_estoque_v4_quebras', JSON.stringify(cleaned));
           } catch {}
-          saveToCodeStorage({ type: 'quebras', quebras: cleaned });
+          markLocalDatasetMutation('quebras', cleaned.length, false, nowTs);
+          saveQuebrasToFirestore(cleaned, { updatedAt: nowTs }).catch(() => {});
+          saveToCodeStorage({ type: 'quebras', quebras: cleaned, syncMeta: getLocalSyncMeta() });
           return cleaned;
         });
 
@@ -528,8 +579,11 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             updatedVales = [...prev, ...parsed];
           }
 
+          const nowTs = Date.now();
           persistData(STORAGE_KEYS.VALES, updatedVales);
-          saveToCodeStorage({ type: 'vales', vales: updatedVales });
+          markLocalDatasetMutation('vales', updatedVales.length, false, nowTs);
+          saveValesToFirestore(updatedVales, { updatedAt: nowTs }).catch(() => {});
+          saveToCodeStorage({ type: 'vales', vales: updatedVales, syncMeta: getLocalSyncMeta() });
           return updatedVales;
         });
 
@@ -571,9 +625,12 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             updatedTrocas = [...prev, ...parsed];
           }
 
+          const nowTs = Date.now();
           persistData(STORAGE_KEYS.TROCAS, updatedTrocas);
           persistData(STORAGE_KEYS.TROCAS_V4, updatedTrocas);
-          saveToCodeStorage({ type: 'trocas', trocas: updatedTrocas });
+          markLocalDatasetMutation('trocas', updatedTrocas.length, false, nowTs);
+          saveTrocasToFirestore(updatedTrocas, { updatedAt: nowTs }).catch(() => {});
+          saveToCodeStorage({ type: 'trocas', trocas: updatedTrocas, syncMeta: getLocalSyncMeta() });
           return updatedTrocas;
         });
 
@@ -618,8 +675,11 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             updatedFaltas = [...prev, ...parsed];
           }
 
+          const nowTs = Date.now();
           persistData(STORAGE_KEYS.FALTAS, updatedFaltas);
-          saveToCodeStorage({ type: 'faltas', faltasMapeadas: updatedFaltas });
+          markLocalDatasetMutation('faltasMapeadas', updatedFaltas.length, false, nowTs);
+          saveFaltasToFirestore(updatedFaltas, { updatedAt: nowTs }).catch(() => {});
+          saveToCodeStorage({ type: 'faltas', faltasMapeadas: updatedFaltas, syncMeta: getLocalSyncMeta() });
           return updatedFaltas;
         });
 
@@ -645,6 +705,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
         let newTrocasList: TrocaItem[] = [];
         let newFaltasList: FaltaMapeadaItem[] = [];
 
+        const batchTs = Date.now();
         if (batchResult.quebras.length > 0) {
           setQuebras(prev => {
             const merged = importMode === 'replace' ? batchResult.quebras : [...prev, ...batchResult.quebras];
@@ -655,6 +716,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             try {
               localStorage.setItem('gestao_estoque_v4_quebras', JSON.stringify(cleaned));
             } catch {}
+            markLocalDatasetMutation('quebras', cleaned.length, false, batchTs);
+            saveQuebrasToFirestore(cleaned, { updatedAt: batchTs }).catch(() => {});
             return cleaned;
           });
         }
@@ -664,6 +727,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             const merged = importMode === 'replace' ? batchResult.vales : [...prev, ...batchResult.vales];
             newValesList = merged;
             persistData(STORAGE_KEYS.VALES, merged);
+            markLocalDatasetMutation('vales', merged.length, false, batchTs);
+            saveValesToFirestore(merged, { updatedAt: batchTs }).catch(() => {});
             return merged;
           });
         }
@@ -674,6 +739,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             newTrocasList = merged;
             persistData(STORAGE_KEYS.TROCAS, merged);
             persistData(STORAGE_KEYS.TROCAS_V4, merged);
+            markLocalDatasetMutation('trocas', merged.length, false, batchTs);
+            saveTrocasToFirestore(merged, { updatedAt: batchTs }).catch(() => {});
             return merged;
           });
         }
@@ -683,6 +750,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             const merged = importMode === 'replace' ? batchResult.faltasMapeadas : [...prev, ...batchResult.faltasMapeadas];
             newFaltasList = merged;
             persistData(STORAGE_KEYS.FALTAS, merged);
+            markLocalDatasetMutation('faltasMapeadas', merged.length, false, batchTs);
+            saveFaltasToFirestore(merged, { updatedAt: batchTs }).catch(() => {});
             return merged;
           });
         }
@@ -692,7 +761,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
           quebras: batchResult.quebras.length > 0 ? newQuebrasList : undefined,
           vales: batchResult.vales.length > 0 ? newValesList : undefined,
           trocas: batchResult.trocas.length > 0 ? newTrocasList : undefined,
-          faltasMapeadas: batchResult.faltasMapeadas.length > 0 ? newFaltasList : undefined
+          faltasMapeadas: batchResult.faltasMapeadas.length > 0 ? newFaltasList : undefined,
+          syncMeta: getLocalSyncMeta(),
         });
 
         setStatusMessage({ 

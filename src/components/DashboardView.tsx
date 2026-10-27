@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { 
   TrendingDown, 
   TrendingUp,
@@ -44,20 +44,15 @@ import {
   FaltaMapeadaItem, 
   DepositoId,
   ViewTab,
-  FrozenReconciliation
+  FrozenReconciliation,
+  ProductMaster
 } from '../types';
-import { formatCurrency, formatHectoliters, formatNumber, formatSkuUnit } from '../utils/parsers';
-import { 
-  calculateSkuDeviations, 
-  isQuebraPendente, 
-  isQuebraFaturada, 
-  isValePendente, 
-  isTrocaPendente 
-} from '../utils/desviosUtils';
+import { formatCurrency, formatNumber } from '../utils/parsers';
+import { getFaltaItemCalculatedValues } from '../utils/desviosUtils';
 import { DEPOSITOS } from '../data/initialData';
 import { RecontagemRankingsModal } from './RecontagemRankingsModal';
 import { RecontagemExportSheet, getDivergenciaSkuFechado } from './RecontagemExportSheet';
-import { computeDashboardRankingItems } from '../utils/rankingUtils';
+import { reconcileAllStock, ReconciliationMode } from '../utils/reconciliationEngine';
 
 interface DashboardViewProps {
   stockPositions: StockPositionItem[];
@@ -71,6 +66,9 @@ interface DashboardViewProps {
   onOpenManualModal?: (type?: 'quebra' | 'vale' | 'troca' | 'falta') => void;
   weeklyBillingStatus?: Record<string, 'PENDENTE' | 'OK'>;
   frozenReconciliations?: FrozenReconciliation[];
+  productsMap?: Map<string, ProductMaster>;
+  reconciliationMode?: ReconciliationMode;
+  onChangeReconciliationMode?: (mode: ReconciliationMode) => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -85,6 +83,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onOpenManualModal,
   weeklyBillingStatus,
   frozenReconciliations = [],
+  productsMap,
+  reconciliationMode,
+  onChangeReconciliationMode,
 }) => {
   // Obter o congelamento mais recente para exibição de status conectado
   const latestFrozen = useMemo(() => {
@@ -153,488 +154,153 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   };
 
   // Filter mode requested by user: Com Ajustes (Equalizado) vs Sem Ajustes (Bruto)
-  const [dashboardFilterMode, setDashboardFilterMode] = useState<'com_ajustes' | 'sem_ajustes'>('com_ajustes');
+  const initialMode: ReconciliationMode = reconciliationMode || 'com_ajuste';
+  const [dashboardFilterMode, setDashboardFilterMode] = useState<'com_ajustes' | 'sem_ajustes'>(
+    initialMode === 'com_ajuste' ? 'com_ajustes' : 'sem_ajustes'
+  );
+  const [rankingAdjustmentMode, setRankingAdjustmentMode] = useState<ReconciliationMode>(initialMode);
 
-  // Ranking view calculation mode: 'sem_ajuste' (bruto: físico vs fiscal) vs 'com_ajuste' (físico + soma de todos os desvios vs fiscal)
-  const [rankingAdjustmentMode, setRankingAdjustmentMode] = useState<'com_ajuste' | 'sem_ajuste'>('com_ajuste');
+  useEffect(() => {
+    if (reconciliationMode) {
+      setRankingAdjustmentMode(reconciliationMode);
+      setDashboardFilterMode(reconciliationMode === 'com_ajuste' ? 'com_ajustes' : 'sem_ajustes');
+    }
+  }, [reconciliationMode]);
 
   // Painel de Amortizações e Divergências Mapeadas Congeladas (Inicia MINIMIZADO por padrão)
   const [isAmortizacoesExpanded, setIsAmortizacoesExpanded] = useState<boolean>(false);
   const [selectedAmortizacaoTab, setSelectedAmortizacaoTab] = useState<'quebras' | 'vales' | 'trocas' | 'faltas' | null>(null);
 
-  // Sincronização bidirecional completa entre Painel Geral e Ranking
+  // Sincronização bidirecional completa entre Painel Geral, Ranking e Tela de Conciliação
   const handleToggleFilterMode = (mode: 'com_ajustes' | 'sem_ajustes') => {
+    const canonical: ReconciliationMode = mode === 'com_ajustes' ? 'com_ajuste' : 'sem_ajuste';
     setDashboardFilterMode(mode);
-    setRankingAdjustmentMode(mode === 'com_ajustes' ? 'com_ajuste' : 'sem_ajuste');
+    setRankingAdjustmentMode(canonical);
+    onChangeReconciliationMode?.(canonical);
   };
 
-  const handleToggleRankingMode = (mode: 'com_ajuste' | 'sem_ajuste') => {
+  const handleToggleRankingMode = (mode: ReconciliationMode) => {
     setRankingAdjustmentMode(mode);
     setDashboardFilterMode(mode === 'com_ajuste' ? 'com_ajustes' : 'sem_ajustes');
+    onChangeReconciliationMode?.(mode);
   };
 
-  // Filter by selected depósito if applicable
-  const filteredStock = useMemo(() => {
-    if (selectedDeposito === 'ALL') return stockPositions;
-    return stockPositions.filter(s => s.deposito === selectedDeposito);
-  }, [stockPositions, selectedDeposito]);
-
-  const filteredQuebras = useMemo(() => {
-    if (selectedDeposito === 'ALL') return quebras;
-    return quebras.filter(q => q.deposito === selectedDeposito);
-  }, [quebras, selectedDeposito]);
-
-  // REGRA DE NEGÓCIO CRÍTICA AMBEV:
-  // Apenas desvios PENDENTES de faturamento amortizam as diferenças de estoque na conciliação.
-  // As quebras, trocas e vales já faturados/baixados foram baixados contabilmente e não amortizam.
-  const pendingQuebras = useMemo(() => {
-    return filteredQuebras.filter(q => isQuebraPendente(q, weeklyBillingStatus));
-  }, [filteredQuebras, weeklyBillingStatus]);
-
-  const faturadasQuebras = useMemo(() => {
-    return filteredQuebras.filter(q => isQuebraFaturada(q, weeklyBillingStatus));
-  }, [filteredQuebras, weeklyBillingStatus]);
-
-  const filteredVales = useMemo(() => {
-    if (selectedDeposito === 'ALL') return vales;
-    return vales.filter(v => v.deposito === selectedDeposito);
-  }, [vales, selectedDeposito]);
-
-  const pendingVales = useMemo(() => {
-    return filteredVales.filter(v => isValePendente(v, weeklyBillingStatus));
-  }, [filteredVales, weeklyBillingStatus]);
-
-  const filteredTrocas = useMemo(() => {
-    if (selectedDeposito === 'ALL') return trocas;
-    return trocas.filter(t => t.deposito === selectedDeposito);
-  }, [trocas, selectedDeposito]);
-
-  const pendingTrocas = useMemo(() => {
-    return filteredTrocas.filter(t => isTrocaPendente(t, weeklyBillingStatus));
-  }, [filteredTrocas, weeklyBillingStatus]);
-
-  const filteredFaltas = useMemo(() => {
-    if (selectedDeposito === 'ALL') return faltasMapeadas;
-    return faltasMapeadas.filter(f => !f.deposito || f.deposito === selectedDeposito);
-  }, [faltasMapeadas, selectedDeposito]);
-
-  // Cache de alta performance dos desvios calculados por SKU
-  // Garante 100% de paridade instantânea entre Cards Executivos e Rankings
-  const skuDeviationsMap = useMemo(() => {
-    const map = new Map<string, ReturnType<typeof calculateSkuDeviations>>();
-    filteredStock.forEach((item) => {
-      const sku = String(item.produto).trim();
-      const key = `${item.deposito}-${sku}`;
-      if (!map.has(key)) {
-        const fator = Math.max(1, item.fatorSku || 1);
-        const dev = calculateSkuDeviations(
-          sku,
-          item.deposito,
-          fator,
-          item.valorUnitario,
-          item.valorCaixa,
-          item.fatorHl,
-          pendingQuebras,
-          pendingVales,
-          pendingTrocas,
-          filteredFaltas,
-          weeklyBillingStatus
-        );
-        map.set(key, dev);
-      }
+  // Motor Único Canônico de Conciliação (100% paridade entre Dashboard, Conciliação, Modais e Excel)
+  const reconciled = useMemo(() => {
+    return reconcileAllStock({
+      stockPositions,
+      quebras,
+      vales,
+      trocas,
+      faltasMapeadas,
+      selectedDeposito,
+      weeklyBillingStatus,
+      productsMap,
     });
-    return map;
-  }, [filteredStock, pendingQuebras, pendingVales, pendingTrocas, filteredFaltas, weeklyBillingStatus]);
+  }, [stockPositions, quebras, vales, trocas, faltasMapeadas, selectedDeposito, weeklyBillingStatus, productsMap]);
 
-  // Financial and HL calculations
+  const filteredStock = reconciled.healedStock;
+  const pendingQuebras = reconciled.desviosSummary.pendingQuebras;
+  const pendingVales = reconciled.desviosSummary.pendingVales;
+  const pendingTrocas = reconciled.desviosSummary.pendingTrocas;
+  const pendingFaltas = reconciled.desviosSummary.pendingFaltas;
+
   const stats = useMemo(() => {
-    // 1. Reconciliation Divergences
-    let totalDisponivelUnits = 0;
-    let totalInventarioUnits = 0;
-    let totalDisponivelSkus = 0;
-    let totalInventarioSkus = 0;
-    let valorTotalEstoqueFisico = 0;
-    let valorTotalEstoqueDisponivel = 0;
-    let totalPrejuizoConciliacao = 0; // Faltas (R$)
-    let totalSobraConciliacao = 0; // Sobras (R$)
-    let totalSobraSkus = 0;
-    let totalSobraHl = 0;
-    let totalPrejuizoHl = 0;
-    let totalPrejuizoSkusBruto = 0;
-    let totalDiferencaHl = 0;
-    let totalItensComFalta = 0;
-    let totalItensComSobra = 0;
-    let totalItensAcurados = 0;
+    const sa = reconciled.totalsSemAjuste;
+    const ca = reconciled.totalsComAjuste;
+    const dv = reconciled.desviosSummary;
 
-    let totalItensSaldoNegativo = 0;
+    const totalAmortizadoValor = dv.totalDesviosValor;
+    const totalAmortizadoSkus = dv.totalQuebrasQtd + dv.totalValesQtd + dv.totalTrocasQtd + dv.totalFaltasMapeadasQtd;
+    const residualAposFatores = Math.max(0, sa.totalFaltasValor - totalAmortizadoValor);
 
-    filteredStock.forEach((item) => {
-      // Itens com saldo negativo desconsiderado ficam fora dos totais de caixas, valor, HL e acurácia
-      if (item.saldoNegativoDesconsiderado || item.disponivelTotalUnits < 0) {
-        totalItensSaldoNegativo++;
-        return;
-      }
-
-      totalDisponivelUnits += item.disponivelTotalUnits;
-      totalInventarioUnits += item.inventarioTotalUnits;
-      
-      const dispSkus = item.disponivelSkus;
-      const invSkus = item.inventarioSkus;
-      totalDisponivelSkus += dispSkus;
-      totalInventarioSkus += invSkus;
-
-      // Valoração total em caixas/SKUs
-      valorTotalEstoqueFisico += invSkus * item.valorCaixa;
-      valorTotalEstoqueDisponivel += dispSkus * item.valorCaixa;
-      
-      if (item.status === 'FALTA') {
-        totalPrejuizoConciliacao += item.prejuizoFinanceiro;
-        totalItensComFalta++;
-        totalPrejuizoSkusBruto += Math.abs(item.diferencaSkus);
-        totalPrejuizoHl += Math.abs(item.impactoHl);
-        totalDiferencaHl += item.impactoHl;
-      } else if (item.status === 'SOBRA') {
-        totalSobraConciliacao += item.sobraFinanceira;
-        totalItensComSobra++;
-        totalSobraSkus += item.diferencaSkus;
-        totalSobraHl += item.impactoHl;
-        totalDiferencaHl += item.impactoHl;
-      } else {
-        totalItensAcurados++;
-      }
-    });
-
-    const totalItensValidos = filteredStock.length - totalItensSaldoNegativo;
-    const acuracidadePct = totalItensValidos > 0 
-      ? Math.max(0, Math.min(100, (totalItensAcurados / totalItensValidos) * 100))
+    const percentualAmortizadoOperacional = sa.totalFaltasValor > 0
+      ? Math.min(100, (totalAmortizadoValor / sa.totalFaltasValor) * 100)
       : 100;
-
-    // 2. Quebras (Apenas PENDENTES amortizam o estoque físico na conciliação; faturadas já foram baixadas)
-    const totalQuebrasValor = pendingQuebras.reduce((acc, q) => acc + (q.valorTotal || 0), 0);
-    const totalQuebrasHl = pendingQuebras.reduce((acc, q) => acc + (q.volumeHl || 0), 0);
-    const totalQuebrasQtd = pendingQuebras.reduce((acc, q) => acc + (q.quantidade || 0), 0);
-
-    // Quebras Faturadas (Informativo de auditoria - baixadas no financeiro, NÃO amortizam o estoque)
-    const totalQuebrasFaturadasValor = faturadasQuebras.reduce((acc, q) => acc + (q.valorTotal || 0), 0);
-    const totalQuebrasFaturadasHl = faturadasQuebras.reduce((acc, q) => acc + (q.volumeHl || 0), 0);
-    const totalQuebrasFaturadasQtd = faturadasQuebras.reduce((acc, q) => acc + (q.quantidade || 0), 0);
-    const totalQuebrasFaturadasCount = faturadasQuebras.length;
-    const totalQuebrasPendentesCount = pendingQuebras.length;
-
-    // 3. Vales (Apenas PENDENTES)
-    const totalValesValor = pendingVales.reduce((acc, v) => acc + (v.valorTotal || 0), 0);
-    const totalValesHl = pendingVales.reduce((acc, v) => acc + (v.volumeHl || 0), 0);
-    const totalValesQtd = pendingVales.reduce((acc, v) => acc + (v.quantidade || 0), 0);
-
-    // 4. Trocas & Reposições (Apenas PENDENTES)
-    const totalTrocasValor = pendingTrocas.reduce((acc, t) => acc + (t.valorTotal || 0), 0);
-    const totalTrocasHl = pendingTrocas.reduce((acc, t) => acc + (t.volumeHl || 0), 0);
-    const totalTrocasQtd = pendingTrocas.reduce((acc, t) => acc + (t.quantidade || 0), 0);
-
-    // 5. Faltas Mapeadas (SKU fechado)
-    const totalFaltasValor = filteredFaltas.reduce((acc, f) => acc + (f.valorTotal || 0), 0);
-    const totalFaltasHl = filteredFaltas.reduce((acc, f) => acc + (f.volumeHl || 0), 0);
-    const totalFaltasQtd = filteredFaltas.reduce((acc, f) => acc + (f.quantidade || f.quantidadeSkus || 0), 0);
-
-    // Consolidated Losses
-    const prejuizoGeral = totalPrejuizoConciliacao + totalQuebrasValor + totalValesValor + totalTrocasValor + totalFaltasValor;
-    const volumeHlGeral = Math.abs(totalDiferencaHl) + totalQuebrasHl + totalValesHl + totalTrocasHl + totalFaltasHl;
-
-    // Fatores de Amortização das Divergências da Conciliação
-    const totalPrejuizoConciliacaoBruto = totalPrejuizoConciliacao;
-    const totalSobraConciliacaoBruto = totalSobraConciliacao;
-    const totalAmortizadoValor = totalQuebrasValor + totalValesValor + totalTrocasValor + totalFaltasValor;
-    const totalAmortizadoSkus = totalQuebrasQtd + totalValesQtd + totalTrocasQtd + totalFaltasQtd;
-
-    // 6. Micro-Equalização Rigorosa SKU a SKU (Garante 100% de paridade com o Ranking de Faltas e Sobras)
-    let totalPrejuizoResidual = 0;
-    let totalSobraResidual = 0;
-    let totalPrejuizoResidualSkus = 0;
-    let totalSobraResidualSkus = 0;
-    let totalPrejuizoResidualHl = 0;
-    let totalSobraResidualHl = 0;
-    let totalItensEqualizadosAcurados = 0;
-
-    filteredStock.forEach((item) => {
-      if (item.saldoNegativoDesconsiderado || item.disponivelTotalUnits < 0) {
-        return;
-      }
-
-      const sku = String(item.produto).trim();
-      const fator = Math.max(1, item.fatorSku || 1);
-      const dev = skuDeviationsMap.get(`${item.deposito}-${sku}`) || calculateSkuDeviations(
-        sku,
-        item.deposito,
-        fator,
-        item.valorUnitario,
-        item.valorCaixa,
-        item.fatorHl,
-        pendingQuebras,
-        pendingVales,
-        pendingTrocas,
-        filteredFaltas,
-        weeklyBillingStatus
-      );
-
-      const fisicoSkus = item.inventarioSkus;
-      const desviosSkus = dev.total.boxesInt;
-      const finalSkus = fisicoSkus + desviosSkus;
-      const fiscalSkus = item.disponivelSkus;
-      let diffSkus = finalSkus - fiscalSkus;
-
-      if (diffSkus < 0) {
-        totalPrejuizoResidual += Math.abs(diffSkus) * item.valorCaixa;
-        totalPrejuizoResidualSkus += Math.abs(diffSkus);
-        totalPrejuizoResidualHl += Math.abs(diffSkus) * item.fatorHl;
-      } else if (diffSkus > 0) {
-        totalSobraResidual += diffSkus * item.valorCaixa;
-        totalSobraResidualSkus += diffSkus;
-        totalSobraResidualHl += diffSkus * item.fatorHl;
-      } else {
-        totalItensEqualizadosAcurados++;
-      }
-    });
-
-    const saldoResidualLiquido = totalSobraResidual - totalPrejuizoResidual;
-    const divergenciaResidualLiquida = Math.max(0, totalPrejuizoResidual - totalSobraResidual);
-    const divergenciaResidualSkus = Math.abs(totalPrejuizoResidualSkus - totalSobraResidualSkus);
-    const superavitLiquido = Math.max(0, totalSobraResidual - totalPrejuizoResidual);
-    const acuracidadeEqualizadaPct = totalItensValidos > 0 
-      ? Math.max(0, Math.min(100, (totalItensEqualizadosAcurados / totalItensValidos) * 100))
-      : 100;
-
-    // Saldo Residual antes de sobras (apenas pós-fatores operacionais)
-    const residualAposFatores = Math.max(0, totalPrejuizoConciliacaoBruto - totalAmortizadoValor);
-
-    const percentualAmortizadoOperacional = totalPrejuizoConciliacaoBruto > 0 
-      ? Math.min(100, (totalAmortizadoValor / totalPrejuizoConciliacaoBruto) * 100) 
-      : 100;
-    const percentualAmortizadoSobras = totalPrejuizoConciliacaoBruto > 0 
-      ? Math.min(100, (totalSobraResidual / totalPrejuizoConciliacaoBruto) * 100) 
+    const percentualAmortizadoSobras = sa.totalFaltasValor > 0
+      ? Math.min(100, (ca.totalSobrasValor / sa.totalFaltasValor) * 100)
       : 0;
-    const percentualAmortizadoTotal = totalPrejuizoConciliacaoBruto > 0 
-      ? Math.min(100, ((totalPrejuizoConciliacaoBruto - divergenciaResidualLiquida) / totalPrejuizoConciliacaoBruto) * 100) 
+    const percentualAmortizadoTotal = sa.totalFaltasValor > 0
+      ? Math.min(100, ((sa.totalFaltasValor - ca.divergenciaLiquidaFalta) / sa.totalFaltasValor) * 100)
       : 100;
-
-    // Equalized Physical vs System units
-    const totalPerdasOperacionaisUnits = totalQuebrasQtd + totalValesQtd + totalTrocasQtd + totalFaltasQtd;
-    const estoqueEqualizadoUnits = totalDisponivelUnits - totalPerdasOperacionaisUnits;
-    const divergenciaResidualUnits = totalInventarioUnits - estoqueEqualizadoUnits;
 
     return {
-      totalItens: filteredStock.length,
-      acuracidadePct,
-      acuracidadeEqualizadaPct,
-      totalDisponivelUnits,
-      totalInventarioUnits,
-      totalDisponivelSkus,
-      totalInventarioSkus,
-      valorTotalEstoqueFisico,
-      valorTotalEstoqueDisponivel,
-      totalPrejuizoConciliacao: totalPrejuizoConciliacaoBruto,
-      totalSobraConciliacao: totalSobraConciliacaoBruto,
-      totalSobraSkus,
-      totalSobraHl,
-      totalPrejuizoHl,
-      totalDiferencaHl,
-      totalItensComFalta,
-      totalItensComSobra,
-      totalItensAcurados,
-      totalQuebrasValor,
-      totalQuebrasHl,
-      totalQuebrasQtd,
-      totalQuebrasPendentesCount,
-      totalQuebrasFaturadasValor,
-      totalQuebrasFaturadasHl,
-      totalQuebrasFaturadasQtd,
-      totalQuebrasFaturadasCount,
-      totalValesValor,
-      totalValesHl,
-      totalValesQtd,
-      totalTrocasValor,
-      totalTrocasHl,
-      totalTrocasQtd,
-      totalFaltasValor,
-      totalFaltasHl,
-      totalFaltasQtd,
-      prejuizoGeral,
-      volumeHlGeral,
+      totalItens: sa.totalItens,
+      acuracidadePct: sa.acuracidadePct,
+      acuracidadeEqualizadaPct: ca.acuracidadePct,
+      totalDisponivelUnits: sa.totalFiscalUnits,
+      totalInventarioUnits: sa.totalFisicoUnits,
+      totalDisponivelSkus: sa.totalFiscalSkus,
+      totalInventarioSkus: sa.totalFisicoSkus,
+      valorTotalEstoqueFisico: sa.valorTotalFisico,
+      valorTotalEstoqueDisponivel: sa.valorTotalFiscal,
+      totalPrejuizoConciliacao: sa.totalFaltasValor,
+      totalSobraConciliacao: sa.totalSobrasValor,
+      totalSobraSkus: sa.totalSobrasSkus,
+      totalSobraHl: sa.totalSobrasHl,
+      totalPrejuizoHl: sa.totalFaltasHl,
+      totalDiferencaHl: sa.saldoLiquidoHl,
+      totalItensComFalta: sa.totalItensComFalta,
+      totalItensComSobra: sa.totalItensComSobra,
+      totalItensAcurados: sa.totalItensAcurados,
+      totalQuebrasValor: dv.totalQuebrasValor,
+      totalQuebrasHl: dv.totalQuebrasHl,
+      totalQuebrasQtd: dv.totalQuebrasQtd,
+      totalQuebrasPendentesCount: dv.totalQuebrasPendentesCount,
+      totalQuebrasFaturadasValor: dv.totalQuebrasFaturadasValor,
+      totalQuebrasFaturadasHl: dv.totalQuebrasFaturadasHl,
+      totalQuebrasFaturadasQtd: dv.totalQuebrasFaturadasQtd,
+      totalQuebrasFaturadasCount: dv.totalQuebrasFaturadasCount,
+      totalValesValor: dv.totalValesValor,
+      totalValesHl: dv.totalValesHl,
+      totalValesQtd: dv.totalValesQtd,
+      totalTrocasValor: dv.totalTrocasValor,
+      totalTrocasHl: dv.totalTrocasHl,
+      totalTrocasQtd: dv.totalTrocasQtd,
+      totalFaltasValor: dv.totalFaltasMapeadasValor,
+      totalFaltasHl: dv.totalFaltasMapeadasHl,
+      totalFaltasQtd: dv.totalFaltasMapeadasQtd,
+      prejuizoGeral: sa.totalFaltasValor + totalAmortizadoValor,
+      volumeHlGeral: Math.abs(sa.saldoLiquidoHl) + dv.totalQuebrasHl + dv.totalValesHl + dv.totalTrocasHl + dv.totalFaltasMapeadasHl,
       totalAmortizadoValor,
       totalAmortizadoSkus,
-      totalCompensacaoGlobalValor: totalAmortizadoValor + totalSobraResidual,
-      totalCompensacaoGlobalSkus: totalAmortizadoSkus + totalSobraResidualSkus,
-      totalPrejuizoSkusBruto,
-      totalPrejuizoResidual,
-      totalSobraResidual,
-      totalPrejuizoResidualSkus,
-      totalSobraResidualSkus,
-      totalPrejuizoResidualHl,
-      totalSobraResidualHl,
-      saldoResidualLiquido,
+      totalCompensacaoGlobalValor: totalAmortizadoValor + ca.totalSobrasValor,
+      totalCompensacaoGlobalSkus: totalAmortizadoSkus + ca.totalSobrasSkus,
+      totalPrejuizoSkusBruto: sa.totalFaltasSkus,
+      totalPrejuizoResidual: ca.totalFaltasValor,
+      totalSobraResidual: ca.totalSobrasValor,
+      totalPrejuizoResidualSkus: ca.totalFaltasSkus,
+      totalSobraResidualSkus: ca.totalSobrasSkus,
+      totalPrejuizoResidualHl: ca.totalFaltasHl,
+      totalSobraResidualHl: ca.totalSobrasHl,
+      saldoResidualLiquido: ca.saldoLiquidoValor,
+      saldoSemAjusteLiquido: sa.saldoLiquidoValor,
+      divergenciaSemAjusteLiquida: sa.divergenciaLiquidaFalta,
       residualAposFatores,
-      divergenciaResidualLiquida,
-      divergenciaResidualSkus,
-      superavitLiquido,
+      divergenciaResidualLiquida: ca.divergenciaLiquidaFalta,
+      divergenciaResidualSkus: Math.abs(ca.saldoLiquidoSkus),
+      superavitLiquido: ca.superavitLiquido,
       percentualAmortizadoOperacional,
       percentualAmortizadoSobras,
       percentualAmortizadoTotal,
       percentualAmortizado: percentualAmortizadoTotal,
-      totalPerdasOperacionaisUnits,
-      estoqueEqualizadoUnits,
-      divergenciaResidualUnits,
+      totalPerdasOperacionaisUnits: totalAmortizadoSkus,
+      estoqueEqualizadoUnits: sa.totalFiscalUnits - totalAmortizadoSkus,
+      divergenciaResidualUnits: sa.totalFisicoUnits - (sa.totalFiscalUnits - totalAmortizadoSkus),
     };
-  }, [filteredStock, pendingQuebras, faturadasQuebras, filteredVales, filteredTrocas, filteredFaltas, weeklyBillingStatus]);
+  }, [reconciled]);
 
-  // Computed ranking items reflecting either "Sem Ajuste" (físico bruto) or "Com Ajuste" (físico + soma de todos os desvios)
-  const rankingItems = useMemo(() => {
-    return filteredStock.map(item => {
-      const sku = String(item.produto).trim();
-      const fator = Math.max(1, item.fatorSku || 1);
-
-      // Desvios obtidos do cache unificado (garantia de 100% de paridade com o Painel Geral)
-      const dev = skuDeviationsMap.get(`${item.deposito}-${sku}`) || calculateSkuDeviations(
-        sku,
-        item.deposito,
-        fator,
-        item.valorUnitario,
-        item.valorCaixa,
-        item.fatorHl,
-        pendingQuebras,
-        pendingVales,
-        pendingTrocas,
-        filteredFaltas,
-        weeklyBillingStatus
-      );
-
-      // Todas as guias somam uma quantidade de desvios unificada e coerente:
-      const totalDesviosSkus = dev.total.skus;
-      const totalDesviosUnits = dev.total.units;
-      const desviosRaw = dev.total.raw;
-
-      // Físico contado no inventário
-      const fisicoUnits = item.inventarioTotalUnits;
-      const fisicoRaw = item.inventarioRaw || formatSkuUnit(fisicoUnits, fator);
-
-      // Quantidade Final: o estoque físico soma todos os desvios
-      const finalUnits = fisicoUnits + totalDesviosUnits;
-      const finalRaw = formatSkuUnit(finalUnits, fator);
-
-      // Fiscal (Disponível 02.05.02)
-      const fiscalUnits = item.disponivelTotalUnits;
-      const fiscalRaw = item.disponivelRaw || formatSkuUnit(fiscalUnits, fator);
-
-      // Divergência conforme o modo selecionado no botão dos rankings:
-      let diferencaUnits = 0;
-      let diferencaRaw = '0/00';
-      let diferencaSkus = 0;
-      let prejuizoFinanceiro = 0;
-      let sobraFinanceira = 0;
-      let impactoHl = 0;
-
-      if (rankingAdjustmentMode === 'com_ajuste') {
-        // COM AJUSTE: (Físico + Desvios) - Fiscal
-        let diff = finalUnits - fiscalUnits;
-        if (item.saldoNegativoDesconsiderado || fiscalUnits < 0) {
-          diff = 0;
-        }
-        const wholeSkus = Math.trunc(diff / fator);
-
-        // REGRA AMBEV: A conciliação financeira é realizada em cima dos SKUs fechados.
-        // As divergências físicas preservam e exibem tanto os SKUs fechados quanto as Unidades avulsas.
-        if (wholeSkus === 0) {
-          diferencaUnits = diff;
-          diferencaSkus = 0;
-          diferencaRaw = diff === 0 ? '0/00' : formatSkuUnit(Math.abs(diff), fator);
-          prejuizoFinanceiro = 0;
-          sobraFinanceira = 0;
-          impactoHl = 0;
-        } else {
-          diferencaUnits = diff;
-          diferencaSkus = Math.abs(wholeSkus);
-          diferencaRaw = formatSkuUnit(Math.abs(diff), fator);
-          impactoHl = wholeSkus * item.fatorHl;
-
-          if (wholeSkus < 0) {
-            prejuizoFinanceiro = Math.abs(wholeSkus) * item.valorCaixa;
-            sobraFinanceira = 0;
-          } else {
-            prejuizoFinanceiro = 0;
-            sobraFinanceira = wholeSkus * item.valorCaixa;
-          }
-        }
-      } else {
-        // SEM AJUSTE: Reflete rigorosamente o relatório 02.05.02 importado
-        const skus = Math.abs(item.diferencaSkus || 0);
-        diferencaUnits = item.diferencaTotalUnits;
-        diferencaSkus = skus;
-        const rawClean = (item.diferencaRaw || '').replace(/^[+-]/, '').trim();
-        diferencaRaw = rawClean && rawClean !== '0/00'
-          ? rawClean
-          : (item.diferencaTotalUnits !== 0 ? formatSkuUnit(Math.abs(item.diferencaTotalUnits), fator) : '0/00');
-        prejuizoFinanceiro = item.prejuizoFinanceiro;
-        sobraFinanceira = item.sobraFinanceira;
-        impactoHl = item.impactoHl;
-      }
-
-      return {
-        id: item.id,
-        produto: item.produto,
-        descricao: item.descricao,
-        fatorSku: fator,
-        fatorHl: item.fatorHl,
-        valorUnitario: item.valorUnitario,
-        deposito: item.deposito,
-
-        fisicoUnits,
-        fisicoRaw,
-
-        totalDesviosSkus,
-        totalDesviosUnits,
-        desviosRaw,
-        quebrasSkus: dev.quebras.skus,
-        valesSkus: dev.vales.skus,
-        trocasSkus: dev.trocas.skus,
-        faltasSkus: dev.faltas.skus,
-
-        finalUnits,
-        finalRaw,
-
-        fiscalUnits,
-        fiscalRaw,
-
-        diferencaUnits,
-        diferencaRaw,
-        diferencaSkus,
-        prejuizoFinanceiro,
-        sobraFinanceira,
-        impactoHl,
-      };
-    });
-  }, [filteredStock, skuDeviationsMap, rankingAdjustmentMode, pendingQuebras, pendingVales, pendingTrocas, filteredFaltas, weeklyBillingStatus]);
-
-  // Ranking Top Faltas (Prejuízo) e Sobras de acordo com rankingLimit e rankingAdjustmentMode
-  // REGRA DO USUÁRIO: Exibir estritamente SKUs fechados (sem avulsas na listagem), mas os valores financeiros refletem 100% da conciliação
   const allRankingFaltas = useMemo(() => {
-    return [...rankingItems]
-      .filter(item => (item.diferencaUnits < 0 || item.prejuizoFinanceiro > 0) && (item.diferencaSkus > 0 || getDivergenciaSkuFechado(item, false) > 0))
-      .sort((a, b) => {
-        if (b.prejuizoFinanceiro !== a.prejuizoFinanceiro) {
-          return b.prejuizoFinanceiro - a.prejuizoFinanceiro;
-        }
-        return Math.abs(b.diferencaUnits) - Math.abs(a.diferencaUnits);
-      });
-  }, [rankingItems]);
+    return rankingAdjustmentMode === 'com_ajuste'
+      ? reconciled.rankingFaltasComAjuste
+      : reconciled.rankingFaltasSemAjuste;
+  }, [reconciled, rankingAdjustmentMode]);
 
   const allRankingSobras = useMemo(() => {
-    return [...rankingItems]
-      .filter(item => (item.diferencaUnits > 0 || item.sobraFinanceira > 0) && (item.diferencaSkus > 0 || getDivergenciaSkuFechado(item, true) > 0))
-      .sort((a, b) => {
-        if (b.sobraFinanceira !== a.sobraFinanceira) {
-          return b.sobraFinanceira - a.sobraFinanceira;
-        }
-        return Math.abs(b.diferencaUnits) - Math.abs(a.diferencaUnits);
-      });
-  }, [rankingItems]);
+    return rankingAdjustmentMode === 'com_ajuste'
+      ? reconciled.rankingSobrasComAjuste
+      : reconciled.rankingSobrasSemAjuste;
+  }, [reconciled, rankingAdjustmentMode]);
 
   const rankingFaltas = useMemo(() => {
     return rankingLimit === 'ALL' ? allRankingFaltas : allRankingFaltas.slice(0, rankingLimit);
@@ -644,19 +310,29 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return rankingLimit === 'ALL' ? allRankingSobras : allRankingSobras.slice(0, rankingLimit);
   }, [allRankingSobras, rankingLimit]);
 
-  // REGRA DO USUÁRIO: Independente da quantidade de itens filtrados (Top 10, Top 15 ou seleção),
-  // o valor final é o mesmo como se TODOS os itens tivessem entrado na conciliação.
   const totalPrejuizoGeralFaltas = useMemo(() => {
     return rankingAdjustmentMode === 'com_ajuste'
-      ? stats.totalPrejuizoResidual
-      : stats.totalPrejuizoConciliacao;
-  }, [rankingAdjustmentMode, stats.totalPrejuizoResidual, stats.totalPrejuizoConciliacao]);
+      ? reconciled.totalsComAjuste.totalFaltasValor
+      : reconciled.totalsSemAjuste.totalFaltasValor;
+  }, [rankingAdjustmentMode, reconciled]);
 
   const totalValorGeralSobras = useMemo(() => {
     return rankingAdjustmentMode === 'com_ajuste'
-      ? stats.totalSobraResidual
-      : stats.totalSobraConciliacao;
-  }, [rankingAdjustmentMode, stats.totalSobraResidual, stats.totalSobraConciliacao]);
+      ? reconciled.totalsComAjuste.totalSobrasValor
+      : reconciled.totalsSemAjuste.totalSobrasValor;
+  }, [rankingAdjustmentMode, reconciled]);
+
+  const totalGeralSkusFaltas = useMemo(() => {
+    return rankingAdjustmentMode === 'com_ajuste'
+      ? reconciled.totalsComAjuste.totalFaltasSkus
+      : reconciled.totalsSemAjuste.totalFaltasSkus;
+  }, [rankingAdjustmentMode, reconciled]);
+
+  const totalGeralSkusSobras = useMemo(() => {
+    return rankingAdjustmentMode === 'com_ajuste'
+      ? reconciled.totalsComAjuste.totalSobrasSkus
+      : reconciled.totalsSemAjuste.totalSobrasSkus;
+  }, [rankingAdjustmentMode, reconciled]);
 
   const currentDepositoName = useMemo(() => {
     if (selectedDeposito === 'ALL') return 'Todos os Depósitos';
@@ -892,21 +568,38 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* KPI 6: Divergência Residual */}
+        {/* KPI 6: Divergência / Saldo Final (Sincronizado com o Modo Ativo) */}
         <div className="bg-white border-2 border-purple-200 rounded-xl p-4 shadow-xs">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-bold text-purple-800 uppercase tracking-wider">Divergência Residual</span>
+            <span className="text-[11px] font-bold text-purple-800 uppercase tracking-wider">
+              {dashboardFilterMode === 'com_ajustes' ? 'Divergência Residual' : 'Divergência Líquida'}
+            </span>
             <div className="w-8 h-8 rounded-lg bg-purple-100 text-purple-700 border border-purple-200 flex items-center justify-center">
               <Sparkles className="w-4 h-4" />
             </div>
           </div>
           <div className="mt-2.5">
-            <div className={`text-xl font-bold font-mono tracking-tight truncate ${stats.divergenciaResidualLiquida > 0 ? 'text-purple-800' : 'text-emerald-600'}`}>
-              {formatCurrency(stats.divergenciaResidualLiquida)}
-            </div>
-            <p className="text-[11px] text-slate-500 mt-0.5">
-              Saldo Pós-Fatores & Sobras
-            </p>
+            {(() => {
+              const activeDivLiquida = dashboardFilterMode === 'com_ajustes'
+                ? stats.divergenciaResidualLiquida
+                : stats.divergenciaSemAjusteLiquida;
+              const activeSaldoLiquido = dashboardFilterMode === 'com_ajustes'
+                ? stats.saldoResidualLiquido
+                : stats.saldoSemAjusteLiquido;
+              return (
+                <>
+                  <div className={`text-xl font-bold font-mono tracking-tight truncate ${activeDivLiquida > 0 ? 'text-purple-800' : 'text-emerald-600'}`}>
+                    {formatCurrency(activeDivLiquida)}
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] mt-1 pt-1 border-t border-purple-100">
+                    <span className="text-slate-500 font-medium">Saldo Final:</span>
+                    <span className={`font-mono font-bold ${activeSaldoLiquido >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                      {activeSaldoLiquido >= 0 ? '+' : ''}{formatCurrency(activeSaldoLiquido)}
+                    </span>
+                  </div>
+                </>
+              );
+            })()}
           </div>
         </div>
 
@@ -1054,7 +747,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <span>4. Faltas Mapeadas (Doca)</span>
                 </span>
                 <span className="text-[10px] font-bold font-mono px-2 py-0.5 rounded bg-indigo-200/80 text-indigo-900 border border-indigo-300">
-                  {filteredFaltas.length} reg.
+                  {pendingFaltas.length} reg.
                 </span>
               </div>
               <div className="mt-2">
@@ -1195,8 +888,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 )}
 
                 {selectedAmortizacaoTab === 'faltas' && (
-                  filteredFaltas.length === 0 ? (
-                    <p className="text-xs text-slate-500 py-4 text-center">Nenhum registro de falta mapeada neste depósito.</p>
+                  pendingFaltas.length === 0 ? (
+                    <p className="text-xs text-slate-500 py-4 text-center">Nenhum registro de falta mapeada pendente neste depósito.</p>
                   ) : (
                     <table className="w-full text-left text-xs border-collapse">
                       <thead className="bg-indigo-50 text-indigo-900 font-bold border-b border-indigo-200 text-[10px] uppercase">
@@ -1211,17 +904,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 font-mono">
-                        {filteredFaltas.map((f) => (
-                          <tr key={f.id} className="hover:bg-indigo-50/30 text-slate-700">
-                            <td className="py-1.5 px-2 text-[11px]">{f.data ? new Date(f.data).toLocaleDateString('pt-BR') : '-'}</td>
-                            <td className="py-1.5 px-2 font-bold">{f.deposito || selectedDeposito}</td>
-                            <td className="py-1.5 px-2 font-bold text-slate-900">{f.produto || f.codigo}</td>
-                            <td className="py-1.5 px-2 font-sans truncate max-w-xs">{f.descricao}</td>
-                            <td className="py-1.5 px-2 text-center font-bold text-indigo-800">{f.quantidade}</td>
-                            <td className="py-1.5 px-2 text-right font-bold text-indigo-800">R$ {(f.valorTotal || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                            <td className="py-1.5 px-2 font-sans text-slate-600 text-[11px] truncate max-w-xs">{f.motivo || f.observacao || f.origem || '-'}</td>
-                          </tr>
-                        ))}
+                        {pendingFaltas.map((f) => {
+                          const vals = getFaltaItemCalculatedValues(f, productsMap, filteredStock);
+                          return (
+                            <tr key={f.id} className="hover:bg-indigo-50/30 text-slate-700">
+                              <td className="py-1.5 px-2 text-[11px]">{f.data ? new Date(f.data).toLocaleDateString('pt-BR') : '-'}</td>
+                              <td className="py-1.5 px-2 font-bold">{f.deposito || selectedDeposito}</td>
+                              <td className="py-1.5 px-2 font-bold text-slate-900">{f.produto || f.codigo}</td>
+                              <td className="py-1.5 px-2 font-sans truncate max-w-xs">{f.descricao}</td>
+                              <td className="py-1.5 px-2 text-center font-bold text-indigo-800">{vals.quantidadeSkus || f.quantidade}</td>
+                              <td className="py-1.5 px-2 text-right font-bold text-indigo-800">
+                                R$ {vals.valorTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-1.5 px-2 font-sans text-slate-600 text-[11px] truncate max-w-xs">{f.motivo || f.observacao || f.origem || '-'}</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   )
@@ -1338,7 +1036,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
             {/* Botão Ver Tabela */}
             <button 
-              onClick={() => onNavigateTab(rankingAdjustmentMode === 'com_ajuste' ? 'conciliacao_ajustes' : 'conciliacao')}
+              onClick={() => onNavigateTab('conciliacao')}
               className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold transition border border-slate-200 cursor-pointer"
             >
               Ver Conciliação
@@ -1357,7 +1055,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               saldoFinalDisplay={saldoFinalDisplay}
               totalGeralPrejuizoFaltas={totalPrejuizoGeralFaltas}
               totalGeralValorSobras={totalValorGeralSobras}
+              totalGeralSkusFaltas={totalGeralSkusFaltas}
+              totalGeralSkusSobras={totalGeralSkusSobras}
               saldoFinalGeral={totalValorGeralSobras - totalPrejuizoGeralFaltas}
+              saldoFinalSkusGeral={totalGeralSkusSobras - totalGeralSkusFaltas}
               currentDepositoName={currentDepositoName}
               currentMode={rankingAdjustmentMode}
               selectedIds={selectedRecountIds}

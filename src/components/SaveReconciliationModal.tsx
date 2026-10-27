@@ -30,9 +30,9 @@ import {
   UserAccount, 
   FrozenReconciliation 
 } from '../types';
-import { formatCurrency, formatHectoliters, formatSkuUnit } from '../utils/parsers';
-import { calculateSkuDeviations, isQuebraPendente, isQuebraFaturada } from '../utils/desviosUtils';
+import { formatCurrency, formatHectoliters } from '../utils/parsers';
 import { buildReconciliationWorkbook, saveExcelWithFolderPicker } from '../utils/excelReconciliationExport';
+import { reconcileAllStock } from '../utils/reconciliationEngine';
 
 interface SaveReconciliationModalProps {
   isOpen: boolean;
@@ -64,7 +64,7 @@ export const SaveReconciliationModal: React.FC<SaveReconciliationModalProps> = (
   weeklyBillingStatus,
 }) => {
   const [isProcessing, setIsProcessing] = useState(false);
-  const [rankingPreviewTab, setRankingPreviewTab] = useState<'sem_ajustes' | 'com_ajustes'>('sem_ajustes');
+  const [rankingPreviewTab, setRankingPreviewTab] = useState<'sem_ajustes' | 'com_ajustes'>('com_ajustes');
 
   // Utilitários de data local
   const formatBrDate = (isoYMD: string): string => {
@@ -129,245 +129,36 @@ export const SaveReconciliationModal: React.FC<SaveReconciliationModalProps> = (
     setConciliacaoNome(defaultTitle);
   };
 
-  // Quebras pendentes de faturamento (apenas semana corrente e datas restantes inseridas)
-  const pendingQuebras = useMemo(() => {
-    return quebras.filter(q => isQuebraPendente(q, weeklyBillingStatus));
-  }, [quebras, weeklyBillingStatus]);
-
-  const billedQuebras = useMemo(() => {
-    return quebras.filter(q => isQuebraFaturada(q, weeklyBillingStatus));
-  }, [quebras, weeklyBillingStatus]);
-
-  const totalQuebrasPendentesValor = useMemo(() => {
-    return pendingQuebras.reduce((acc, q) => acc + q.valorTotal, 0);
-  }, [pendingQuebras]);
-
-  const totalQuebrasPendentesUnits = useMemo(() => {
-    return pendingQuebras.reduce((acc, q) => acc + q.quantidade, 0);
-  }, [pendingQuebras]);
-
-  // 1. Calcula itens ajustados com todos os desvios
-  const adjustedItems = useMemo<ItemConciliacaoAjustada[]>(() => {
-    return stockPositions.map(stockItem => {
-      const dep = stockItem.deposito;
-      const sku = String(stockItem.produto).trim();
-      const fator = Math.max(1, stockItem.fatorSku || 1);
-
-      const dev = calculateSkuDeviations(
-        sku,
-        dep,
-        fator,
-        stockItem.valorUnitario,
-        stockItem.valorCaixa,
-        stockItem.fatorHl,
-        quebras,
-        vales,
-        trocas,
-        faltasMapeadas,
-        weeklyBillingStatus
-      );
-
-      const totalDesviosUnits = dev.total.units;
-      const totalDesviosSkus = dev.total.skus;
-      const desviosRaw = dev.total.raw;
-      const valorDesvios = dev.total.valor;
-      const hlDesvios = dev.total.volumeHl;
-
-      const fisicoUnits = stockItem.inventarioTotalUnits;
-      const fisicoSkus = Math.floor(fisicoUnits / fator);
-      const valorFisico = fisicoUnits * stockItem.valorUnitario;
-
-      const finalTotalUnits = fisicoUnits + totalDesviosUnits;
-      const finalSkus = Math.floor(finalTotalUnits / fator);
-      const finalRaw = formatSkuUnit(finalTotalUnits, fator);
-      const valorFinal = finalTotalUnits * stockItem.valorUnitario;
-
-      const fiscalUnits = stockItem.disponivelTotalUnits;
-      const fiscalSkus = Math.floor(fiscalUnits / fator);
-      const valorFiscal = fiscalUnits * stockItem.valorUnitario;
-
-      let diff = finalTotalUnits - fiscalUnits;
-      if (stockItem.saldoNegativoDesconsiderado || fiscalUnits < 0) {
-        diff = 0;
-      }
-
-      const wholeSkus = Math.trunc(diff / fator);
-      let divergenciaUnits = 0;
-      let divergenciaSkus = 0;
-      let divergenciaRaw = '0/00';
-      let statusAjustado: 'CONCILIADO' | 'FALTA_RESIDUAL' | 'SOBRA_RESIDUAL' = 'CONCILIADO';
-      let impactoFinanceiroResidual = 0;
-      let impactoHlResidual = 0;
-
-      if (wholeSkus !== 0) {
-        divergenciaSkus = wholeSkus;
-        divergenciaUnits = diff;
-        divergenciaRaw = formatSkuUnit(diff, fator);
-        statusAjustado = wholeSkus > 0 ? 'SOBRA_RESIDUAL' : 'FALTA_RESIDUAL';
-        impactoFinanceiroResidual = wholeSkus * stockItem.valorCaixa;
-        impactoHlResidual = wholeSkus * stockItem.fatorHl;
-      }
-
-      return {
-        deposito: dep,
-        produto: sku,
-        descricao: stockItem.descricao,
-        grupo: stockItem.grupo || 'GERAL',
-        fatorSku: fator,
-        fatorHl: stockItem.fatorHl,
-        valorUnitario: stockItem.valorUnitario,
-        valorCaixa: stockItem.valorCaixa,
-
-        fiscalRaw: stockItem.disponivelRaw,
-        fiscalSkus,
-        fiscalUnits,
-        fiscalTotalUnits: fiscalUnits,
-        valorFiscal,
-
-        desviosRaw,
-        desviosSkus: totalDesviosSkus,
-        desviosUnits: totalDesviosUnits,
-        valorDesvios,
-        hlDesvios,
-        detalheDesvios: {
-          quebrasSkus: dev.quebras.skus,
-          quebrasUnits: dev.quebras.units,
-          quebrasValor: dev.quebras.valor,
-          quebrasRaw: dev.quebras.raw,
-
-          valesSkus: dev.vales.skus,
-          valesUnits: dev.vales.units,
-          valesValor: dev.vales.valor,
-          valesRaw: dev.vales.raw,
-
-          trocasSkus: dev.trocas.skus,
-          trocasUnits: dev.trocas.units,
-          trocasValor: dev.trocas.valor,
-          trocasRaw: dev.trocas.raw,
-
-          faltasSkus: dev.faltas.skus,
-          faltasUnits: dev.faltas.units,
-          faltasValor: dev.faltas.valor,
-          faltasRaw: dev.faltas.raw,
-        },
-
-        fisicoRaw: stockItem.inventarioRaw,
-        fisicoSkus,
-        fisicoUnits,
-        fisicoTotalUnits: fisicoUnits,
-        valorFisico,
-
-        finalRaw,
-        finalTotalUnits,
-        finalSkus,
-        valorFinal,
-
-        divergenciaResidualUnits: divergenciaUnits,
-        divergenciaResidualSkus: divergenciaSkus,
-        divergenciaResidualRaw: divergenciaRaw,
-        statusAjustado,
-
-        impactoFinanceiroResidual,
-        impactoHlResidual,
-        recontado: stockItem.recontado,
-      };
+  // Motor Único Canônico de Conciliação (100% paridade com Dashboard & Conciliação)
+  const reconciled = useMemo(() => {
+    return reconcileAllStock({
+      stockPositions,
+      quebras,
+      vales,
+      trocas,
+      faltasMapeadas,
+      selectedDeposito,
+      weeklyBillingStatus,
+      productsMap,
     });
-  }, [stockPositions, quebras, vales, trocas, faltasMapeadas, weeklyBillingStatus]);
+  }, [stockPositions, quebras, vales, trocas, faltasMapeadas, selectedDeposito, weeklyBillingStatus, productsMap]);
 
-  // 2. Apuração dos Rankings Sem Ajustes (02.05.02)
-  const rankingFaltasSemAjustes = useMemo<RankingItem[]>(() => {
-    return stockPositions
-      .filter(s => s.status === 'FALTA' && s.prejuizoFinanceiro > 0)
-      .sort((a, b) => b.prejuizoFinanceiro - a.prejuizoFinanceiro)
-      .map((s, index) => ({
-        posicao: index + 1,
-        codigo: s.produto,
-        descricao: s.descricao,
-        grupo: s.grupo || 'GERAL',
-        deposito: s.deposito,
-        fatorSku: s.fatorSku,
-        quantidadeUnidades: Math.abs(s.diferencaTotalUnits),
-        quantidadeSkus: Math.abs(s.diferencaSkus),
-        quantidadeRaw: s.diferencaRaw,
-        impactoFinanceiro: -s.prejuizoFinanceiro,
-        impactoHl: s.impactoHl,
-        tipo: 'FALTA',
-        comAjustes: false,
-      }));
-  }, [stockPositions]);
+  const pendingQuebras = reconciled.desviosSummary.pendingQuebras;
+  const billedQuebras = reconciled.desviosSummary.faturadasQuebras;
+  const totalQuebrasPendentesValor = reconciled.desviosSummary.totalQuebrasValor;
+  const totalQuebrasPendentesUnits = reconciled.desviosSummary.totalQuebrasQtd;
 
-  const rankingSobrasSemAjustes = useMemo<RankingItem[]>(() => {
-    return stockPositions
-      .filter(s => s.status === 'SOBRA' && s.sobraFinanceira > 0)
-      .sort((a, b) => b.sobraFinanceira - a.sobraFinanceira)
-      .map((s, index) => ({
-        posicao: index + 1,
-        codigo: s.produto,
-        descricao: s.descricao,
-        grupo: s.grupo || 'GERAL',
-        deposito: s.deposito,
-        fatorSku: s.fatorSku,
-        quantidadeUnidades: s.diferencaTotalUnits,
-        quantidadeSkus: s.diferencaSkus,
-        quantidadeRaw: s.diferencaRaw,
-        impactoFinanceiro: s.sobraFinanceira,
-        impactoHl: s.impactoHl,
-        tipo: 'SOBRA',
-        comAjustes: false,
-      }));
-  }, [stockPositions]);
+  const adjustedItems = reconciled.adjustedItems;
+  const rankingFaltasSemAjustes = reconciled.excelRankingFaltasSemAjustes;
+  const rankingSobrasSemAjustes = reconciled.excelRankingSobrasSemAjustes;
+  const rankingFaltasComAjustes = reconciled.excelRankingFaltasComAjustes;
+  const rankingSobrasComAjustes = reconciled.excelRankingSobrasComAjustes;
 
-  // 3. Apuração dos Rankings Com Ajustes (Equalizado com Desvios)
-  const rankingFaltasComAjustes = useMemo<RankingItem[]>(() => {
-    return adjustedItems
-      .filter(item => item.statusAjustado === 'FALTA_RESIDUAL')
-      .sort((a, b) => Math.abs(b.impactoFinanceiroResidual) - Math.abs(a.impactoFinanceiroResidual))
-      .map((item, index) => ({
-        posicao: index + 1,
-        codigo: item.produto,
-        descricao: item.descricao,
-        grupo: item.grupo,
-        deposito: item.deposito,
-        fatorSku: item.fatorSku,
-        quantidadeUnidades: Math.abs(item.divergenciaResidualUnits),
-        quantidadeSkus: Math.abs(item.divergenciaResidualSkus),
-        quantidadeRaw: item.divergenciaResidualRaw,
-        impactoFinanceiro: item.impactoFinanceiroResidual,
-        impactoHl: item.impactoHlResidual,
-        tipo: 'FALTA',
-        comAjustes: true,
-      }));
-  }, [adjustedItems]);
-
-  const rankingSobrasComAjustes = useMemo<RankingItem[]>(() => {
-    return adjustedItems
-      .filter(item => item.statusAjustado === 'SOBRA_RESIDUAL')
-      .sort((a, b) => b.impactoFinanceiroResidual - a.impactoFinanceiroResidual)
-      .map((item, index) => ({
-        posicao: index + 1,
-        codigo: item.produto,
-        descricao: item.descricao,
-        grupo: item.grupo,
-        deposito: item.deposito,
-        fatorSku: item.fatorSku,
-        quantidadeUnidades: item.divergenciaResidualUnits,
-        quantidadeSkus: item.divergenciaResidualSkus,
-        quantidadeRaw: item.divergenciaResidualRaw,
-        impactoFinanceiro: item.impactoFinanceiroResidual,
-        impactoHl: item.impactoHlResidual,
-        tipo: 'SOBRA',
-        comAjustes: true,
-      }));
-  }, [adjustedItems]);
-
-  // Totais Gerais
-  const totalFaltasSemAjustesValor = rankingFaltasSemAjustes.reduce((acc, r) => acc + Math.abs(r.impactoFinanceiro), 0);
-  const totalSobrasSemAjustesValor = rankingSobrasSemAjustes.reduce((acc, r) => acc + r.impactoFinanceiro, 0);
-
-  const totalFaltasComAjustesValor = rankingFaltasComAjustes.reduce((acc, r) => acc + Math.abs(r.impactoFinanceiro), 0);
-  const totalSobrasComAjustesValor = rankingSobrasComAjustes.reduce((acc, r) => acc + r.impactoFinanceiro, 0);
-
-  const totalDesviosValor = adjustedItems.reduce((acc, item) => acc + item.valorDesvios, 0);
+  const totalFaltasSemAjustesValor = reconciled.totalsSemAjuste.totalFaltasValor;
+  const totalSobrasSemAjustesValor = reconciled.totalsSemAjuste.totalSobrasValor;
+  const totalFaltasComAjustesValor = reconciled.totalsComAjuste.totalFaltasValor;
+  const totalSobrasComAjustesValor = reconciled.totalsComAjuste.totalSobrasValor;
+  const totalDesviosValor = reconciled.desviosSummary.totalDesviosValor;
 
   if (!isOpen) return null;
 
@@ -392,7 +183,7 @@ export const SaveReconciliationModal: React.FC<SaveReconciliationModalProps> = (
         .replace(/[^a-zA-Z0-9_\-\.]/g, '_');
 
       const wb = buildReconciliationWorkbook({
-        stockPositions,
+        stockPositions: reconciled.healedStock,
         adjustedItems,
         rankingSobrasSemAjustes,
         rankingFaltasSemAjustes,
@@ -428,36 +219,36 @@ export const SaveReconciliationModal: React.FC<SaveReconciliationModalProps> = (
         name: conciliacaoNome || defaultTitle,
         date: brDate,
         time: horaConciliacao,
-        totalItems: stockPositions.length,
-        totalPrejuizo: totalFaltasSemAjustesValor,
-        totalSobras: totalSobrasSemAjustesValor,
-        acuraciaInventario: (totalSobrasSemAjustesValor + totalFaltasSemAjustesValor === 0) ? 100 : 98.4,
+        totalItems: reconciled.healedStock.length,
+        totalPrejuizo: totalFaltasComAjustesValor,
+        totalSobras: totalSobrasComAjustesValor,
+        acuraciaInventario: reconciled.totalsComAjuste.acuracidadePct,
         usuario: currentUser?.nome || 'Analista de Estoque',
         deposito: selectedDeposito,
-        totalSkus: stockPositions.length,
+        totalSkus: reconciled.healedStock.length,
 
         totalFaltasSemAjustesValor,
         totalSobrasSemAjustesValor,
-        saldoLiquidoSemAjustesValor: totalSobrasSemAjustesValor - totalFaltasSemAjustesValor,
-        totalHlSemAjustes: stockPositions.reduce((acc, s) => acc + s.impactoHl, 0),
+        saldoLiquidoSemAjustesValor: reconciled.totalsSemAjuste.saldoLiquidoValor,
+        totalHlSemAjustes: reconciled.totalsSemAjuste.saldoLiquidoHl,
 
         totalDesviosValor,
-        totalQuebrasValor: totalQuebrasPendentesValor,
-        totalValesValor: vales.reduce((acc, v) => acc + v.valorTotal, 0),
-        totalTrocasValor: trocas.reduce((acc, t) => acc + t.valorTotal, 0),
-        totalFaltasValor: faltasMapeadas.reduce((acc, f) => acc + (f.valorTotal || 0), 0),
+        totalQuebrasValor: reconciled.desviosSummary.totalQuebrasValor,
+        totalValesValor: reconciled.desviosSummary.totalValesValor,
+        totalTrocasValor: reconciled.desviosSummary.totalTrocasValor,
+        totalFaltasValor: reconciled.desviosSummary.totalFaltasMapeadasValor,
 
         totalFaltasComAjustesValor,
         totalSobrasComAjustesValor,
-        saldoLiquidoComAjustesValor: totalSobrasComAjustesValor - totalFaltasComAjustesValor,
-        totalHlComAjustes: adjustedItems.reduce((acc, item) => acc + item.impactoHlResidual, 0),
+        saldoLiquidoComAjustesValor: reconciled.totalsComAjuste.saldoLiquidoValor,
+        totalHlComAjustes: reconciled.totalsComAjuste.saldoLiquidoHl,
 
         rankingSobrasSemAjustes,
         rankingFaltasSemAjustes,
         rankingSobrasComAjustes,
         rankingFaltasComAjustes,
 
-        itensSemAjustes: stockPositions,
+        itensSemAjustes: reconciled.healedStock,
         itensComAjustes: adjustedItems
       };
 

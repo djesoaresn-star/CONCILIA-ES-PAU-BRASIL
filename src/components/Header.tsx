@@ -37,29 +37,27 @@ interface HeaderProps {
   currentUser?: UserAccount | null;
   onNavigateLogin?: () => void;
   onLogout?: () => void;
+  cloudSyncStatus?: 'synced' | 'syncing' | 'local';
+  lastCloudSyncLabel?: string | null;
+  onForceCloudSync?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   currentTab,
-  setCurrentTab,
   selectedDeposito,
   setSelectedDeposito,
   startDate,
   setStartDate,
   endDate,
   setEndDate,
-  onOpenImportModal,
   onOpenManualFaltaModal,
   onOpenManualModal,
-  onResetData,
-  onExportReport,
   onToggleMobileMenu,
-  currentUser,
-  onNavigateLogin,
   onLogout,
+  cloudSyncStatus = 'synced',
+  lastCloudSyncLabel,
+  onForceCloudSync,
 }) => {
-  const currentDepObj = DEPOSITOS.find(d => d.id === selectedDeposito);
-
   const handleOpenManual = () => {
     if (onOpenManualModal) {
       onOpenManualModal('quebra');
@@ -125,16 +123,42 @@ export const Header: React.FC<HeaderProps> = ({
         )}
       </div>
 
-      {/* Right: Cloud Sync Status & User Profile Actions */}
+      {/* Right: Cloud Sync Button & User Actions */}
       <div className="flex items-center gap-2.5 sm:gap-3">
-        <div 
-          className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 shadow-2xs"
-          title="Sincronização em nuvem ativa com o Firebase Firestore. Todas as tabelas e dados mantêm sincronização em tempo real."
+        <button
+          type="button"
+          onClick={onForceCloudSync}
+          disabled={cloudSyncStatus === 'syncing'}
+          className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition cursor-pointer shadow-2xs ${
+            cloudSyncStatus === 'syncing'
+              ? 'bg-blue-50 text-blue-800 border-blue-200'
+              : cloudSyncStatus === 'local'
+              ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
+              : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
+          }`}
+          title={
+            lastCloudSyncLabel
+              ? `Sincronização em nuvem (AI Studio ↔ GitHub). Última sincronização: ${lastCloudSyncLabel}. Clique para sincronizar agora.`
+              : 'Sincronização em nuvem ativa (AI Studio ↔ GitHub). Clique para sincronizar agora.'
+          }
         >
-          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-          <Database className="w-3.5 h-3.5 text-emerald-600" />
-          <span>Sincronizado</span>
-        </div>
+          {cloudSyncStatus === 'syncing' ? (
+            <RefreshCw className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+          ) : (
+            <Database
+              className={`w-3.5 h-3.5 ${
+                cloudSyncStatus === 'local' ? 'text-amber-600' : 'text-emerald-600'
+              }`}
+            />
+          )}
+          <span>
+            {cloudSyncStatus === 'syncing'
+              ? 'Sincronizando...'
+              : cloudSyncStatus === 'local'
+              ? 'Modo Local · Reconectar'
+              : 'Sincronizado na Nuvem'}
+          </span>
+        </button>
 
         {/* Quick Launch Manual Congelamento */}
         <button
@@ -161,3 +185,4 @@ export const Header: React.FC<HeaderProps> = ({
     </header>
   );
 };
+

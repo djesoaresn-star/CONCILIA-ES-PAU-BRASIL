@@ -33,7 +33,8 @@ import {
   Activity,
   Warehouse,
   Target,
-  ShieldAlert
+  ShieldAlert,
+  CheckSquare
 } from 'lucide-react';
 import { QuebraItem, DepositoId, AreaLossSummary, WeeklyLossSummary } from '../types';
 import { INITIAL_QUEBRAS } from '../data/initialData';
@@ -53,6 +54,8 @@ import {
   exportCompleteWorkbookToExcel,
   parseDateSafe,
   getMonthName,
+  getWeekRangeInfo,
+  isValidDateRangeLabel,
   WqiMetricsSummary
 } from '../utils/quebrasReports';
 import { safeLocalStorageSet, persistData, STORAGE_KEYS } from '../utils/persistentStorage';
@@ -196,6 +199,9 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
   const [autoProportional, setAutoProportional] = useState<boolean>(true);
   const [disproportionateDetected, setDisproportionateDetected] = useState<boolean>(false);
   const [deletingQuebra, setDeletingQuebra] = useState<QuebraItem | null>(null);
+  // Múltipla seleção no Relatório Detalhado de Quebras
+  const [selectedDetailedIds, setSelectedDetailedIds] = useState<Set<string>>(new Set());
+  const [isBulkDeleteModalOpen, setIsBulkDeleteModalOpen] = useState(false);
 
   // Label do Depósito e do Período para cabeçalhos executivos
   const depositoLabel = useMemo(() => {
@@ -1025,6 +1031,94 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
     showToast(`Lançamento SKU ${targetSku} excluído e atualizado no código com sucesso!`);
   };
 
+  // Sanitização automática: remove qualquer 'MANUAL' de semanaRef mantendo todas as informações
+  useEffect(() => {
+    const hasManual = quebras.some(q => q.semanaRef && q.semanaRef.toUpperCase().includes('MANUAL'));
+    if (hasManual && onUpdateQuebras) {
+      const sanitized = quebras.map(q => {
+        if (q.semanaRef && q.semanaRef.toUpperCase().includes('MANUAL')) {
+          const dt = parseDateSafe(q.data);
+          return {
+            ...q,
+            semanaRef: dt ? getWeekRangeInfo(dt).label : q.semanaRef
+          };
+        }
+        return q;
+      });
+      onUpdateQuebras(sanitized);
+      try {
+        localStorage.setItem('gestao_estoque_v4_quebras', JSON.stringify(sanitized));
+      } catch {}
+      persistData(STORAGE_KEYS.QUEBRAS, sanitized);
+      saveToCodeStorage({ type: 'quebras', quebras: sanitized });
+    }
+  }, [quebras, onUpdateQuebras]);
+
+  // Cálculos de seleção múltipla para o Relatório Detalhado
+  const selectedDetailedItems = useMemo(() => {
+    if (selectedDetailedIds.size === 0) return [];
+    return quebras.filter(q => selectedDetailedIds.has(q.id));
+  }, [quebras, selectedDetailedIds]);
+
+  const selectedTotalValor = useMemo(() => {
+    return selectedDetailedItems.reduce((acc, q) => acc + (q.valorTotal || 0), 0);
+  }, [selectedDetailedItems]);
+
+  const selectedTotalHl = useMemo(() => {
+    return selectedDetailedItems.reduce((acc, q) => acc + (q.volumeHl || 0), 0);
+  }, [selectedDetailedItems]);
+
+  const selectedTotalUnits = useMemo(() => {
+    return selectedDetailedItems.reduce((acc, q) => acc + (q.quantidade || 0), 0);
+  }, [selectedDetailedItems]);
+
+  const isAllDetailedSelected = useMemo(() => {
+    return fullyFilteredQuebras.length > 0 && fullyFilteredQuebras.every(q => selectedDetailedIds.has(q.id));
+  }, [fullyFilteredQuebras, selectedDetailedIds]);
+
+  const handleToggleSelectAllDetailed = () => {
+    if (isAllDetailedSelected) {
+      setSelectedDetailedIds(new Set());
+    } else {
+      const allIds = new Set(fullyFilteredQuebras.map(q => q.id));
+      setSelectedDetailedIds(allIds);
+    }
+  };
+
+  const handleToggleSelectOneDetailed = (id: string) => {
+    setSelectedDetailedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleClearDetailedSelection = () => {
+    setSelectedDetailedIds(new Set());
+  };
+
+  const handleConfirmBulkDelete = () => {
+    if (selectedDetailedIds.size === 0) return;
+
+    const count = selectedDetailedIds.size;
+    const updatedQuebras = quebras.filter(q => !selectedDetailedIds.has(q.id));
+
+    if (onUpdateQuebras) {
+      onUpdateQuebras(updatedQuebras);
+    }
+    try {
+      localStorage.setItem('gestao_estoque_v4_quebras', JSON.stringify(updatedQuebras));
+    } catch (err) {}
+
+    persistData(STORAGE_KEYS.QUEBRAS, updatedQuebras);
+    saveToCodeStorage({ type: 'quebras', quebras: updatedQuebras });
+
+    setSelectedDetailedIds(new Set());
+    setIsBulkDeleteModalOpen(false);
+    showToast(`${count} lançamentos de quebras foram excluídos com sucesso!`);
+  };
+
   return (
     <div className="space-y-4 pb-12">
       {/* Toast Notification */}
@@ -1458,7 +1552,9 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
                     return (
                       <tr key={week.id} className="hover:bg-slate-50 transition">
                         <td className="py-3 px-4 font-mono font-bold text-slate-800">
-                          {week.label}
+                          {(!week.label || week.label.toUpperCase().includes('MANUAL'))
+                            ? (week.startDate && week.endDate ? `${week.startDate.slice(0, 5)} - ${week.endDate.slice(0, 5)}` : week.startDate || 'Semana Atual')
+                            : week.label}
                         </td>
                         <td className="py-3 px-4 text-right font-mono font-bold text-slate-900 text-sm">
                           {formatCurrency(week.somaValor)}
@@ -1736,8 +1832,36 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
           {/* Tabela Amarela Detalhada (Conforme Foto 3) */}
           <div className="bg-white border border-slate-300 rounded-xl shadow-sm overflow-hidden">
             <div className="bg-yellow-400 text-slate-900 px-4 py-2.5 font-bold text-xs uppercase tracking-wider flex flex-wrap items-center justify-between gap-2 border-b border-yellow-500">
-              <span className="font-extrabold">RELATÓRIO DETALHADO DE QUEBRAS</span>
+              <div className="flex items-center space-x-2.5">
+                <span className="font-extrabold">RELATÓRIO DETALHADO DE QUEBRAS</span>
+                {selectedDetailedIds.size > 0 && (
+                  <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-slate-900 text-white flex items-center gap-1 shadow-xs animate-in fade-in">
+                    <CheckSquare className="w-3.5 h-3.5 text-amber-400" />
+                    <span>{selectedDetailedIds.size} selecionado(s)</span>
+                  </span>
+                )}
+              </div>
               <div className="flex items-center space-x-2">
+                {selectedDetailedIds.size > 0 && (
+                  <>
+                    <button
+                      onClick={() => setIsBulkDeleteModalOpen(true)}
+                      className="px-3 py-1 bg-rose-700 hover:bg-rose-800 text-white rounded text-[11px] font-bold transition flex items-center space-x-1.5 shadow-sm active:scale-95 cursor-pointer animate-in fade-in"
+                      title="Excluir todos os itens selecionados de uma vez"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Excluir Selecionados ({selectedDetailedIds.size})</span>
+                    </button>
+                    <button
+                      onClick={handleClearDetailedSelection}
+                      className="px-2 py-1 bg-slate-800/80 hover:bg-slate-900 text-slate-200 rounded text-[11px] font-semibold transition flex items-center space-x-1 cursor-pointer"
+                      title="Limpar seleção"
+                    >
+                      <X className="w-3 h-3" />
+                      <span>Desmarcar</span>
+                    </button>
+                  </>
+                )}
                 <button
                   onClick={handleExportDetailedPdf}
                   disabled={isExportingPdf}
@@ -1761,6 +1885,15 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-yellow-300/80 text-slate-900 font-bold uppercase text-[10px] tracking-wider border-b border-yellow-400">
+                    <th className="py-2.5 px-3 text-center w-10">
+                      <input
+                        type="checkbox"
+                        checked={isAllDetailedSelected}
+                        onChange={handleToggleSelectAllDetailed}
+                        className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer accent-blue-600"
+                        title={isAllDetailedSelected ? "Desmarcar todos" : "Selecionar todos os registros filtrados"}
+                      />
+                    </th>
                     <th className="py-2.5 px-3 whitespace-nowrap">DATA</th>
                     <th className="py-2.5 px-3 whitespace-nowrap">MÊS</th>
                     <th className="py-2.5 px-3 whitespace-nowrap">PRODUTO</th>
@@ -1778,67 +1911,86 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 text-slate-800">
-                  {fullyFilteredQuebras.map((item) => (
-                    <tr key={item.id} className="hover:bg-yellow-50/50 transition font-sans">
-                      <td className="py-2 px-3 font-mono text-slate-700 whitespace-nowrap">{item.data}</td>
-                      <td className="py-2 px-3 font-semibold text-slate-600 uppercase whitespace-nowrap">
-                        {item.mes || getMonthName(item.data)}
-                      </td>
-                      <td className="py-2 px-3 font-mono font-bold text-slate-900">{item.sku}</td>
-                      <td className="py-2 px-3 font-medium text-slate-800">{item.descricao}</td>
-                      <td className="py-2 px-3 text-right font-mono font-bold text-slate-900">{item.quantidade}</td>
-                      <td className="py-2 px-3 font-semibold text-slate-600">{formatTurno(item.turno)}</td>
-                      <td className="py-2 px-3 font-mono text-slate-500">{item.codQuebra}</td>
-                      <td className="py-2 px-3 font-bold text-slate-700">{item.area}</td>
-                      <td className="py-2 px-3">
-                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
-                          {item.motivo}
-                        </span>
-                      </td>
-                      <td className="py-2 px-3 text-slate-500 font-mono text-[11px]">{item.colaborador || '-'}</td>
-                      <td className="py-2 px-3 text-right font-mono font-bold text-slate-900 whitespace-nowrap">
-                        {formatCurrency(item.valorTotal)}
-                      </td>
-                      <td className="py-2 px-3 text-right font-mono text-slate-700 whitespace-nowrap">
-                        {item.volumeHl.toFixed(3).replace('.', ',')}
-                      </td>
-                      <td className="py-2 px-3 text-center whitespace-nowrap">
-                        {item.faturado || (item.semanaRef && weeklyBillingStatus[item.semanaRef] === 'OK') ? (
-                          <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded">
-                            OK
+                  {fullyFilteredQuebras.map((item) => {
+                    const isSelected = selectedDetailedIds.has(item.id);
+                    return (
+                      <tr 
+                        key={item.id} 
+                        className={`transition font-sans ${
+                          isSelected
+                            ? 'bg-amber-100/90 hover:bg-amber-100 font-medium'
+                            : 'hover:bg-yellow-50/50'
+                        }`}
+                      >
+                        <td className="py-2 px-3 text-center" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => handleToggleSelectOneDetailed(item.id)}
+                            className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer accent-blue-600"
+                            title="Selecionar para exclusão em massa"
+                          />
+                        </td>
+                        <td className="py-2 px-3 font-mono text-slate-700 whitespace-nowrap">{item.data}</td>
+                        <td className="py-2 px-3 font-semibold text-slate-600 uppercase whitespace-nowrap">
+                          {item.mes || getMonthName(item.data)}
+                        </td>
+                        <td className="py-2 px-3 font-mono font-bold text-slate-900">{item.sku}</td>
+                        <td className="py-2 px-3 font-medium text-slate-800">{item.descricao}</td>
+                        <td className="py-2 px-3 text-right font-mono font-bold text-slate-900">{item.quantidade}</td>
+                        <td className="py-2 px-3 font-semibold text-slate-600">{formatTurno(item.turno)}</td>
+                        <td className="py-2 px-3 font-mono text-slate-500">{item.codQuebra}</td>
+                        <td className="py-2 px-3 font-bold text-slate-700">{item.area}</td>
+                        <td className="py-2 px-3">
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                            {item.motivo}
                           </span>
-                        ) : (
-                          <span className="text-[10px] font-bold text-rose-700 bg-rose-100 px-2 py-0.5 rounded">
-                            PENDENTE
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-2 px-3 text-center whitespace-nowrap">
-                        <div className="flex items-center justify-center space-x-1">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenEditModal(item)}
-                            className="p-1.5 text-blue-600 hover:text-blue-800 hover:bg-blue-100 rounded transition"
-                            title="Editar lançamento de quebra"
-                          >
-                            <Pencil className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenDeleteModal(item)}
-                            className="p-1.5 text-rose-600 hover:text-rose-800 hover:bg-rose-100 rounded transition"
-                            title="Excluir lançamento de quebra"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td className="py-2 px-3 text-slate-500 font-mono text-[11px]">{item.colaborador || '-'}</td>
+                        <td className="py-2 px-3 text-right font-mono font-bold text-slate-900 whitespace-nowrap">
+                          {formatCurrency(item.valorTotal)}
+                        </td>
+                        <td className="py-2 px-3 text-right font-mono text-slate-700 whitespace-nowrap">
+                          {item.volumeHl.toFixed(3).replace('.', ',')}
+                        </td>
+                        <td className="py-2 px-3 text-center whitespace-nowrap">
+                          {item.faturado || (item.semanaRef && weeklyBillingStatus[item.semanaRef] === 'OK') ? (
+                            <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded">
+                              OK
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-bold text-rose-700 bg-rose-100 px-2 py-0.5 rounded">
+                              PENDENTE
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 text-center whitespace-nowrap">
+                          <div className="flex items-center justify-center space-x-1">
+                            <button
+                              type="button"
+                              onClick={() => handleOpenEditModal(item)}
+                              className="p-1.5 text-blue-600 hover:text-blue-800 hover:bg-blue-100 rounded transition"
+                              title="Editar lançamento de quebra"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenDeleteModal(item)}
+                              className="p-1.5 text-rose-600 hover:text-rose-800 hover:bg-rose-100 rounded transition"
+                              title="Excluir lançamento de quebra"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
                 <tfoot className="bg-yellow-200/90 font-bold text-slate-900 border-t-2 border-yellow-500">
                   <tr>
-                    <td colSpan={4} className="py-2.5 px-3 uppercase text-[11px] tracking-wide">
+                    <td colSpan={5} className="py-2.5 px-3 uppercase text-[11px] tracking-wide">
                       TOTAL GERAL ({fullyFilteredQuebras.length} REGISTROS)
                     </td>
                     <td className="py-2.5 px-3 text-right font-mono text-xs">
@@ -1857,6 +2009,38 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
               </table>
             </div>
           </div>
+
+          {/* Barra Flutuante de Ações em Massa */}
+          {selectedDetailedIds.size > 0 && (
+            <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-2xl border border-slate-700 flex flex-wrap items-center justify-between gap-4 animate-in slide-in-from-bottom-4 duration-200">
+              <div className="flex items-center space-x-2.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse" />
+                <span className="text-xs font-bold text-slate-100">
+                  {selectedDetailedIds.size} de {fullyFilteredQuebras.length} selecionado(s)
+                </span>
+                <span className="text-xs text-slate-400 font-mono">
+                  (R$ {formatCurrency(selectedTotalValor)} | {selectedTotalHl.toFixed(2)} HL)
+                </span>
+              </div>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setIsBulkDeleteModalOpen(true)}
+                  className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl transition flex items-center space-x-1.5 shadow-md active:scale-95 cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Excluir Selecionados ({selectedDetailedIds.size})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleClearDetailedSelection}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition cursor-pointer"
+                >
+                  Desmarcar
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -2972,6 +3156,85 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
         </div>
       )}
 
+      {/* MODAL DE CONFIRMAÇÃO DE EXCLUSÃO EM MASSA */}
+      {isBulkDeleteModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-lg w-full p-6 relative animate-in zoom-in-95 duration-200">
+            <button
+              onClick={() => setIsBulkDeleteModalOpen(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-600 p-1 rounded-lg"
+              title="Fechar"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center space-x-3 mb-4">
+              <div className="w-11 h-11 rounded-xl bg-rose-100 text-rose-600 border border-rose-200 flex items-center justify-center shadow-xs">
+                <Trash2 className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-slate-900">
+                  Excluir Múltiplos Lançamentos
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Exclusão em massa no Relatório Detalhado de Quebras
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-rose-50/70 border border-rose-200 rounded-xl p-4 text-xs text-rose-900 space-y-3 mb-5">
+              <div className="flex items-start space-x-2.5">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <p className="font-semibold text-sm leading-snug">
+                  Tem certeza que deseja excluir todos os {selectedDetailedIds.size} lançamentos selecionados de uma vez?
+                </p>
+              </div>
+
+              <div className="bg-white/90 rounded-xl p-3 border border-rose-200/80 space-y-2 text-xs">
+                <div className="flex justify-between items-center py-1 border-b border-slate-100">
+                  <span className="text-slate-600 font-medium">Total de Registros:</span>
+                  <span className="font-mono font-bold text-slate-900">{selectedDetailedIds.size} lançamentos</span>
+                </div>
+                <div className="flex justify-between items-center py-1 border-b border-slate-100">
+                  <span className="text-slate-600 font-medium">Quantidade Total:</span>
+                  <span className="font-mono font-bold text-slate-900">{selectedTotalUnits} unidades</span>
+                </div>
+                <div className="flex justify-between items-center py-1 border-b border-slate-100">
+                  <span className="text-slate-600 font-medium">Prejuízo Financeiro:</span>
+                  <span className="font-mono font-bold text-rose-600">-{formatCurrency(selectedTotalValor)}</span>
+                </div>
+                <div className="flex justify-between items-center py-1">
+                  <span className="text-slate-600 font-medium">Volume Hectolitros:</span>
+                  <span className="font-mono font-bold text-amber-700">{formatHectoliters(selectedTotalHl)}</span>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-rose-700 leading-normal">
+                Esta ação removerá definitivamente os lançamentos selecionados da base de dados e atualizará <strong>imediatamente os saldos de estoque, amortização e relatórios operacionais</strong>.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end space-x-2.5">
+              <button
+                type="button"
+                onClick={() => setIsBulkDeleteModalOpen(false)}
+                className="px-4 py-2 border border-slate-300 hover:bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold transition cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmBulkDelete}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-md transition flex items-center space-x-1.5 active:scale-95 cursor-pointer"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>Excluir {selectedDetailedIds.size} Lançamentos</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL DE CENTRAL DE EXPORTAÇÃO (PDF COM GRÁFICOS & EXCEL) */}
       {isExportModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
@@ -3231,7 +3494,11 @@ export const QuebrasView: React.FC<QuebrasViewProps> = ({
             <tbody className="divide-y divide-slate-200">
               {weeklyReportList.map((week) => (
                 <tr key={week.id}>
-                  <td className="py-2 px-3 font-mono font-bold text-slate-800">{week.label}</td>
+                  <td className="py-2 px-3 font-mono font-bold text-slate-800">
+                    {(!week.label || week.label.toUpperCase().includes('MANUAL'))
+                      ? (week.startDate && week.endDate ? `${week.startDate.slice(0, 5)} - ${week.endDate.slice(0, 5)}` : week.startDate || 'Semana Atual')
+                      : week.label}
+                  </td>
                   <td className="py-2 px-3 text-right font-mono font-bold text-slate-900">{formatCurrency(week.somaValor)}</td>
                   <td className="py-2 px-3 text-right font-mono">{week.hectolitro.toFixed(2).replace('.', ',')}</td>
                   <td className="py-2 px-3 text-center font-bold">

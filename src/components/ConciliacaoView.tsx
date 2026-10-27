@@ -11,6 +11,7 @@ import {
 } from '../types';
 import { ConciliacaoAjustesView } from './ConciliacaoAjustesView';
 import { ConciliacaoPadraoView } from './ConciliacaoPadraoView';
+import { ReconciliationMode } from '../utils/reconciliationEngine';
 
 export interface ConciliacaoViewProps {
   stockPositions: StockPositionItem[];
@@ -26,6 +27,8 @@ export interface ConciliacaoViewProps {
   trocas?: TrocaItem[];
   faltasMapeadas?: FaltaMapeadaItem[];
   initialSubTab?: 'padrao' | 'ajustes';
+  reconciliationMode?: ReconciliationMode;
+  onChangeReconciliationMode?: (mode: ReconciliationMode) => void;
   onNavigateTab?: (tab: ViewTab) => void;
   onOpenSaveModal?: () => void;
   onOpenManualModal?: (type?: 'quebra' | 'vale' | 'troca' | 'falta') => void;
@@ -33,14 +36,27 @@ export interface ConciliacaoViewProps {
 }
 
 export const ConciliacaoView: React.FC<ConciliacaoViewProps> = (props) => {
-  const [subTab, setSubTab] = useState<'padrao' | 'ajustes'>(props.initialSubTab || 'padrao');
+  const resolveSubTab = (): 'padrao' | 'ajustes' => {
+    if (props.reconciliationMode) {
+      return props.reconciliationMode === 'com_ajuste' ? 'ajustes' : 'padrao';
+    }
+    return props.initialSubTab || 'ajustes';
+  };
 
-  // Keep in sync with initialSubTab when parent tab selection changes
+  const [subTab, setSubTab] = useState<'padrao' | 'ajustes'>(resolveSubTab);
+
   useEffect(() => {
-    if (props.initialSubTab) {
+    if (props.reconciliationMode) {
+      setSubTab(props.reconciliationMode === 'com_ajuste' ? 'ajustes' : 'padrao');
+    } else if (props.initialSubTab) {
       setSubTab(props.initialSubTab);
     }
-  }, [props.initialSubTab]);
+  }, [props.reconciliationMode, props.initialSubTab]);
+
+  const handleToggleSubTab = (mode: 'padrao' | 'ajustes') => {
+    setSubTab(mode);
+    props.onChangeReconciliationMode?.(mode === 'ajustes' ? 'com_ajuste' : 'sem_ajuste');
+  };
 
   if (subTab === 'ajustes') {
     return (
@@ -57,12 +73,12 @@ export const ConciliacaoView: React.FC<ConciliacaoViewProps> = (props) => {
         isRecountApplied={props.isRecountApplied}
         onNavigateTab={(tab) => {
           if (tab === 'conciliacao') {
-            setSubTab('padrao');
+            handleToggleSubTab('padrao');
           } else if (props.onNavigateTab) {
             props.onNavigateTab(tab);
           }
         }}
-        onToggleSubTab={(mode) => setSubTab(mode)}
+        onToggleSubTab={handleToggleSubTab}
         onOpenImportModal={props.onOpenImportModal}
         onOpenSaveModal={props.onOpenSaveModal}
         onOpenManualModal={props.onOpenManualModal}
@@ -75,7 +91,7 @@ export const ConciliacaoView: React.FC<ConciliacaoViewProps> = (props) => {
     <ConciliacaoPadraoView
       {...props}
       subTab={subTab}
-      onToggleSubTab={(mode) => setSubTab(mode)}
+      onToggleSubTab={handleToggleSubTab}
     />
   );
 };

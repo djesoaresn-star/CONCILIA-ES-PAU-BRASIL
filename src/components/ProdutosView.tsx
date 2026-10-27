@@ -19,7 +19,7 @@ import {
   AlertCircle
 } from 'lucide-react';
 import { ProductMaster, StockPositionItem } from '../types';
-import { formatCurrency, formatHectoliters } from '../utils/parsers';
+import { formatCurrency, formatHectoliters, calcularDivergencia } from '../utils/parsers';
 import { ProductFormModal } from './ProductFormModal';
 import { DeleteProductModal } from './DeleteProductModal';
 
@@ -133,32 +133,32 @@ export const ProdutosView: React.FC<ProdutosViewProps> = ({
       return next;
     });
 
-    // If existing stock positions reference this product, recalculate financial and unit numbers
+    // If existing stock positions reference this product, recalculate financial and unit numbers using Closed-SKU rule
     if (setStockPositions && stockPositions.length > 0) {
       setStockPositions(prev => prev.map(item => {
         if (item.produto === product.codigo) {
-          const fatorSku = product.fatorSku || 1;
-          const valorUnitario = product.valorUnit;
-          const valorCaixa = product.valor;
-          const fatorHl = product.fatorHl;
-          
-          const diferencaTotalUnits = item.diferencaTotalUnits;
-          const impactoFinanceiro = diferencaTotalUnits * valorUnitario;
-          const prejuizoFinanceiro = item.status === 'FALTA' ? Math.abs(impactoFinanceiro) : 0;
-          const sobraFinanceira = item.status === 'SOBRA' ? impactoFinanceiro : 0;
-          const impactoHl = (diferencaTotalUnits / fatorSku) * fatorHl;
+          const fatorSku = Math.max(1, product.fatorSku || 1);
+          const valorCaixa = product.valor > 0 ? product.valor : (product.valorUnit * fatorSku);
+          const valorUnitario = valorCaixa / fatorSku;
+          const fatorHl = product.fatorHl || 0;
+          const div = calcularDivergencia(
+            item.disponivelRaw,
+            item.inventarioRaw,
+            fatorSku,
+            valorUnitario,
+            fatorHl
+          );
 
           return {
             ...item,
             descricao: product.descricao,
+            grupo: product.grupo || item.grupo,
             fatorSku,
+            custoMedio: valorUnitario,
             valorUnitario,
             valorCaixa,
             fatorHl,
-            impactoFinanceiro,
-            prejuizoFinanceiro,
-            sobraFinanceira,
-            impactoHl
+            ...div,
           };
         }
         return item;

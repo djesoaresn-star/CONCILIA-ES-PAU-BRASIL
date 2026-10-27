@@ -79,7 +79,7 @@ export {
 
 let quotaExceededState = false;
 let quotaExceededTimestamp = 0;
-const QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours cooldown
+const QUOTA_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes cooldown so historical flags do not lock out sync
 
 export function isQuotaExceeded(): boolean {
   if (quotaExceededState) {
@@ -106,6 +106,20 @@ export function isQuotaExceeded(): boolean {
   return false;
 }
 
+export async function clearQuotaExceededAndReconnect(): Promise<boolean> {
+  quotaExceededState = false;
+  quotaExceededTimestamp = 0;
+  if (typeof localStorage !== 'undefined') {
+    try {
+      localStorage.removeItem('firestore_quota_exceeded');
+    } catch {}
+  }
+  try {
+    await enableNetwork(db);
+  } catch {}
+  return testConnection();
+}
+
 export function markQuotaExceeded(): void {
   quotaExceededState = true;
   quotaExceededTimestamp = Date.now();
@@ -122,24 +136,21 @@ export function markQuotaExceeded(): void {
   }
 }
 
-// On startup, immediately disable network if quota was previously exceeded to prevent retry storms
+// On startup, only pause network if within short cooldown window
 if (isQuotaExceeded()) {
   try {
     disableNetwork(db).catch(() => {});
   } catch {}
-  console.warn('[Firebase] Cota diária do Firestore atingida anteriormente. Modo offline ativado com persistência local (IndexedDB/LocalStorage).');
 }
 
 // Connection test with strict quota protection
 export async function testConnection(): Promise<boolean> {
-  // If quota was already exceeded, avoid bombarding backend with failed queries
   if (isQuotaExceeded()) {
     return false;
   }
 
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
-    console.log('[Firebase] Connection to Firestore established successfully.');
     return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -149,11 +160,15 @@ export async function testConnection(): Promise<boolean> {
       console.warn('[Firebase] Cota diária do Firestore excedida (Quota exceeded). Operando com persistência local.');
       return false;
     }
-    if (error instanceof Error && (error.message.includes('the client is offline') || error.message.includes('unavailable') || error.message.includes('could not be completed'))) {
-      console.warn('[Firebase] Client is operating in offline/cached mode:', error.message);
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error('Please check your Firebase configuration.');
     }
     return false;
   }
+}
+
+if (typeof window !== 'undefined') {
+  testConnection().catch(() => {});
 }
 
 // Standard Error Handler per Firebase Integration Skill

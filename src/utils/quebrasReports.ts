@@ -153,6 +153,17 @@ export function calculateAreaLosses(quebras: QuebraItem[]): {
 }
 
 /**
+ * Valida se um rótulo de semana é um intervalo de datas válido (ex: "19/10 - 23/10"),
+ * rejeitando estritamente rótulos como 'MANUAL' ou strings sem datas.
+ */
+export function isValidDateRangeLabel(str?: string | null): boolean {
+  if (!str) return false;
+  const s = String(str).trim().toUpperCase();
+  if (s.includes('MANUAL')) return false;
+  return /\d{1,2}\/\d{1,2}/.test(s);
+}
+
+/**
  * 2. RELATÓRIO: 8 ÚLTIMAS SEMANAS COM STATUS E FATURAMENTO (Conforme Imagem 2)
  * As 8 últimas semanas cobrem as 8 semanas consecutivas anteriores e até a data filtrada.
  */
@@ -165,24 +176,36 @@ export function calculateWeeklyLosses(
   weeks: WeeklyLossSummary[];
   total: { somaValor: number; hectolitro: number; quantidadeItens?: number; quantidadeUnidades?: number };
 } {
+  // Normaliza lançamentos: mantém todas as informações importadas/salvas,
+  // mas substitui qualquer semanaRef='MANUAL' ou inválida pela data/intervalo semanal real
+  const sanitizedQuebras = quebras.map(q => {
+    if (!q.semanaRef || q.semanaRef.toUpperCase().includes('MANUAL')) {
+      const dt = parseDateSafe(q.data);
+      if (dt) {
+        return { ...q, semanaRef: getWeekRangeInfo(dt).label };
+      }
+    }
+    return q;
+  });
+
   // 1. Determina a data de referência (data filtrada / máxima)
   let refDate: Date;
   if (referenceDateInput) {
     if (typeof referenceDateInput === 'string') {
-      refDate = parseDateSafe(referenceDateInput) || new Date(2026, 7, 28);
+      refDate = parseDateSafe(referenceDateInput) || new Date();
     } else {
       refDate = referenceDateInput;
     }
   } else {
     // Procura a maior data entre os itens de quebras
     let maxTime = 0;
-    quebras.forEach(q => {
+    sanitizedQuebras.forEach(q => {
       const dt = parseDateSafe(q.data);
       if (dt && dt.getTime() > maxTime) {
         maxTime = dt.getTime();
       }
     });
-    refDate = maxTime > 0 ? new Date(maxTime) : new Date(2026, 7, 28);
+    refDate = maxTime > 0 ? new Date(maxTime) : new Date();
   }
 
   // 2. Calcula a Segunda-feira base da semana de referência
@@ -229,7 +252,7 @@ export function calculateWeeklyLosses(
     const localSignatures = new Set<string>();
 
     // 1. Busca primeiro os lançamentos com data exata dentro do intervalo semanal [wMon, wSun]
-    const dateMatchedItems = quebras.filter(q => {
+    const dateMatchedItems = sanitizedQuebras.filter(q => {
       if (globalAssignedIds.has(q.id)) return false;
       const qDate = parseDateSafe(q.data);
       return qDate && qDate >= wMon && qDate <= wSun;
@@ -249,16 +272,18 @@ export function calculateWeeklyLosses(
           itemsForWeek.push(q);
         }
       });
-      const explicitSemanaRef = itemsForWeek.find(q => q.semanaRef)?.semanaRef;
-      if (explicitSemanaRef) {
+      const explicitSemanaRef = itemsForWeek.find(q => isValidDateRangeLabel(q.semanaRef))?.semanaRef;
+      if (explicitSemanaRef && isValidDateRangeLabel(explicitSemanaRef)) {
         displayLabel = explicitSemanaRef;
+      } else {
+        displayLabel = standardLabel;
       }
     } else {
       // 2. Se não houver itens detalhados por data, busca por semanaRef exata ou aproximada
-      const refMatches = quebras.filter(q => {
+      const refMatches = sanitizedQuebras.filter(q => {
         if (globalAssignedIds.has(q.id)) return false;
         if (q.semanaRef === standardLabel) return true;
-        if (q.semanaRef) {
+        if (q.semanaRef && isValidDateRangeLabel(q.semanaRef)) {
           const parts = q.semanaRef.split('-').map(p => p.trim());
           if (parts.length === 2) {
             const [startStr] = parts;
@@ -284,7 +309,7 @@ export function calculateWeeklyLosses(
           globalAssignedSignatures.add(sig);
           globalAssignedIds.add(q.id);
           itemsForWeek.push(q);
-          if (q.semanaRef && !displayLabel.includes('/')) {
+          if (q.semanaRef && isValidDateRangeLabel(q.semanaRef)) {
             displayLabel = q.semanaRef;
           }
         }
@@ -301,6 +326,11 @@ export function calculateWeeklyLosses(
           itemsForWeek.push(q);
         }
       });
+    }
+
+    // Garante que o displayLabel é estritamente um intervalo de datas e NUNCA 'MANUAL'
+    if (!isValidDateRangeLabel(displayLabel)) {
+      displayLabel = standardLabel;
     }
 
     weekSlots.push({

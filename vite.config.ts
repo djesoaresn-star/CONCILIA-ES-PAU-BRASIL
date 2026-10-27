@@ -35,6 +35,12 @@ function codeDataPersistencePlugin(): Plugin {
               if (payload.vales !== undefined) existing.vales = payload.vales;
               if (payload.trocas !== undefined) existing.trocas = payload.trocas;
               if (payload.faltasMapeadas !== undefined) existing.faltasMapeadas = payload.faltasMapeadas;
+              if (payload.frozenReconciliations !== undefined) existing.frozenReconciliations = payload.frozenReconciliations;
+              if (payload.products !== undefined) existing.products = payload.products;
+              if (payload.weeklyBillingStatus !== undefined) existing.weeklyBillingStatus = payload.weeklyBillingStatus;
+              if (payload.syncMeta !== undefined) {
+                existing.syncMeta = { ...(existing.syncMeta || {}), ...payload.syncMeta };
+              }
               existing.lastUpdated = new Date().toISOString();
 
               fs.writeFileSync(targetPath, JSON.stringify(existing, null, 2), 'utf-8');

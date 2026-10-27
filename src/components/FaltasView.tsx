@@ -19,11 +19,12 @@ import {
 } from 'lucide-react';
 import { FaltaMapeadaItem, DepositoId, ProductMaster } from '../types';
 import { formatCurrency, formatHectoliters } from '../utils/parsers';
-import { isFaltaPendente, isFaltaFaturada } from '../utils/desviosUtils';
+import { isFaltaPendente, isFaltaFaturada, getFaltaItemCalculatedValues } from '../utils/desviosUtils';
 import { deleteFaltaFromFirestore, deleteFaltasBatchFromFirestore } from '../services/firebaseSyncService';
 import { persistData, STORAGE_KEYS } from '../utils/persistentStorage';
 import { saveToCodeStorage } from '../services/codeStorageService';
 import { SkuTechnicalCard } from './SkuTechnicalCard';
+import { RelatorioFaltasPorObservacaoModal } from './RelatorioFaltasPorObservacaoModal';
 
 interface FaltasViewProps {
   faltasMapeadas: FaltaMapeadaItem[];
@@ -54,6 +55,7 @@ export const FaltasView: React.FC<FaltasViewProps> = ({
   const [editingFalta, setEditingFalta] = useState<FaltaMapeadaItem | null>(null);
   const [editFormData, setEditFormData] = useState<Partial<FaltaMapeadaItem>>({});
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [isObsReportModalOpen, setIsObsReportModalOpen] = useState(false);
 
   const filtered = useMemo(() => {
     return faltasMapeadas.filter(f => {
@@ -75,15 +77,13 @@ export const FaltasView: React.FC<FaltasViewProps> = ({
   }, [faltasMapeadas, selectedDeposito, baixaFilter, searchTerm, weeklyBillingStatus]);
 
   const getFaltaVal = (f: FaltaMapeadaItem) => {
-    if (f.valorTotal != null && Number(f.valorTotal) > 0) return Number(f.valorTotal);
-    const units = f.quantidadeUnidades || ((f.quantidade || f.quantidadeSkus || 1) * 12);
-    return units * 10.00;
+    return getFaltaItemCalculatedValues(f, productsMap).valorTotal;
   };
 
   const stats = useMemo(() => {
     const totalCaixas = filtered.reduce((acc, f) => acc + (f.quantidade || f.quantidadeSkus || 0), 0);
     const totalValor = filtered.reduce((acc, f) => acc + getFaltaVal(f), 0);
-    const totalHl = filtered.reduce((acc, f) => acc + (f.volumeHl || 0), 0);
+    const totalHl = filtered.reduce((acc, f) => acc + getFaltaItemCalculatedValues(f, productsMap).volumeHl, 0);
 
     const pendentes = filtered.filter(f => isFaltaPendente(f, weeklyBillingStatus));
     const baixadas = filtered.filter(f => !isFaltaPendente(f, weeklyBillingStatus));
@@ -339,6 +339,15 @@ export const FaltasView: React.FC<FaltasViewProps> = ({
           )}
 
           <button
+            onClick={() => setIsObsReportModalOpen(true)}
+            className="px-3.5 py-2 rounded-md bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-300 text-xs font-semibold transition flex items-center space-x-1.5 cursor-pointer shadow-xs"
+            title="Gerar relatório institucional em PDF agrupado por observação com código, descrição e quantidade"
+          >
+            <FileText className="w-4 h-4 text-rose-600" />
+            <span>Relatório por Observação (PDF)</span>
+          </button>
+
+          <button
             onClick={onOpenManualFaltaModal}
             className="px-4 py-2 rounded-md bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold shadow-sm transition flex items-center space-x-1.5 active:scale-95 cursor-pointer"
           >
@@ -437,6 +446,14 @@ export const FaltasView: React.FC<FaltasViewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => setIsObsReportModalOpen(true)}
+              className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold flex items-center space-x-1.5 transition cursor-pointer shadow-xs"
+              title="Gerar relatório em PDF com as faltas selecionadas agrupadas por observação"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Relatório Selecionadas (PDF)</span>
+            </button>
             <button
               onClick={() => handleBatchBaixa(true)}
               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center space-x-1.5 transition cursor-pointer shadow-xs"
@@ -970,6 +987,17 @@ export const FaltasView: React.FC<FaltasViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Modal de Relatório de Faltas por Observação (PDF & Impressão) */}
+      <RelatorioFaltasPorObservacaoModal
+        isOpen={isObsReportModalOpen}
+        onClose={() => setIsObsReportModalOpen(false)}
+        faltas={faltasMapeadas}
+        selectedDeposito={selectedDeposito}
+        selectedIds={selectedIds}
+        weeklyBillingStatus={weeklyBillingStatus}
+        productsMap={productsMap}
+      />
 
     </div>
   );

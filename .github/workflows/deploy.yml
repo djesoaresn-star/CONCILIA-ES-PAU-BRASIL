@@ -36,7 +36,10 @@ jobs:
       - name: Build Vite App
         env:
           NODE_OPTIONS: '--max-old-space-size=4096'
-        run: npm run build
+        run: |
+          npm run build
+          cp dist/index.html dist/404.html
+          touch dist/.nojekyll
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

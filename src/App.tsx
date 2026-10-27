@@ -49,30 +49,35 @@ import { ImportModal, ImportFileType } from './components/ImportModal';
 import { SaveReconciliationModal } from './components/SaveReconciliationModal';
 import { formatCurrency, formatHectoliters, healStockPositions, healProductMasterMap } from './utils/parsers';
 import { exportConciliacaoExcel } from './utils/excelReconciliationExport';
+import { ReconciliationMode } from './utils/reconciliationEngine';
 import { auth, onAuthStateChanged } from './firebase';
-import { 
-  loadStockPositionsFromFirestore,
-  loadGradePositionsFromFirestore,
-  loadQuebrasFromFirestore,
-  loadValesFromFirestore,
-  loadTrocasFromFirestore,
-  loadFaltasFromFirestore,
-  loadFrozenReconciliationsFromFirestore,
-  loadUsersFromFirestore,
-  loadProductsFromFirestore,
-  loadAppSettingsFromFirestore,
+import {
+  loadWorkspaceMetaFromFirestore,
+  subscribeToWorkspaceMeta,
+  loadStockPositionsSnapshotDetailed,
+  loadGradePositionsSnapshotDetailed,
+  loadQuebrasSnapshotDetailed,
+  loadValesSnapshotDetailed,
+  loadTrocasSnapshotDetailed,
+  loadFaltasSnapshotDetailed,
+  loadFrozenSnapshotDetailed,
+  loadUsersSnapshotDetailed,
+  loadProductsSnapshotDetailed,
+  loadAppSettingsDetailedFromFirestore,
   saveStockPositionsToFirestore,
   saveGradePositionsToFirestore,
   saveQuebrasToFirestore,
   saveValesToFirestore,
   saveTrocasToFirestore,
   saveFaltasToFirestore,
+  saveFrozenReconciliationsSnapshotToFirestore,
   saveFrozenReconciliationToFirestore,
-  saveUserToFirestore,
+  saveUsersSnapshotToFirestore,
   saveProductsToFirestore,
   saveAppSettingsToFirestore,
   logoutFirebase,
-  isQuotaExceeded
+  isQuotaExceeded,
+  clearQuotaExceededAndReconnect,
 } from './services/firebaseSyncService';
 import {
   persistData,
@@ -80,13 +85,21 @@ import {
   retrieveSync,
   removePersistedData,
   safeLocalStorageSet,
-  STORAGE_KEYS
+  STORAGE_KEYS,
+  getLocalSyncMeta,
+  setLocalDatasetStamp,
+  markLocalDatasetMutation,
+  getOrCreateClientId,
+  WorkspaceSyncMeta,
+  SyncDatasetKey,
 } from './utils/persistentStorage';
+import { saveToCodeStorage } from './services/codeStorageService';
 
 export default function App() {
   // Navigation and Filters
   const [currentTab, setCurrentTab] = useState<ViewTab>('dashboard');
   const [selectedDeposito, setSelectedDeposito] = useState<DepositoId | 'ALL'>('ALL');
+  const [reconciliationMode, setReconciliationMode] = useState<ReconciliationMode>('com_ajuste');
   const [startDate, setStartDate] = useState('2026-02-01');
   const [endDate, setEndDate] = useState('2026-02-28');
 
@@ -100,52 +113,57 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
   const [isRecountApplied, setIsRecountApplied] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isResetConfirmModalOpen, setIsResetConfirmModalOpen] = useState(false);
   const [isQuotaWarningVisible, setIsQuotaWarningVisible] = useState<boolean>(() => isQuotaExceeded());
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<'synced' | 'syncing' | 'local'>(() =>
+    isQuotaExceeded() ? 'local' : 'synced'
+  );
+  const [lastCloudSyncLabel, setLastCloudSyncLabel] = useState<string | null>(null);
   const isInitialMountRef = useRef(true);
   const isHydratedRef = useRef(false);
   const isExplicitResetRef = useRef(false);
+  const isSyncingCloudRef = useRef(false);
+  const pendingRemoteMetaRef = useRef<WorkspaceSyncMeta | null>(null);
+  const pushTimersRef = useRef<Partial<Record<SyncDatasetKey, ReturnType<typeof setTimeout>>>>({});
 
   useEffect(() => {
-    const handleQuota = () => setIsQuotaWarningVisible(true);
+    const handleQuota = () => {
+      setIsQuotaWarningVisible(true);
+      setCloudSyncStatus('local');
+    };
     window.addEventListener('firestore-quota-exceeded', handleQuota);
     const timer = setTimeout(() => {
       isInitialMountRef.current = false;
-    }, 4000);
+    }, 2500);
     return () => {
       window.removeEventListener('firestore-quota-exceeded', handleQuota);
       clearTimeout(timer);
     };
   }, []);
 
-  // Core Data States with High-Reliability Persistent Storage (IndexedDB + localStorage)
+  // Core Data States with High-Reliability Persistent Storage (IndexedDB + localStorage + persistedCodeData)
   const [productsMap, setProductsMap] = useState<Map<string, ProductMaster>>(() => {
     try {
-      const saved = localStorage.getItem('gestao_estoque_v3_produtos');
-      if (saved) {
-        const arr = JSON.parse(saved) as [string, ProductMaster][];
+      const savedArr = retrieveSync<[string, ProductMaster][]>(STORAGE_KEYS.PRODUCTS, []);
+      const legacyRaw = !savedArr.length ? localStorage.getItem('gestao_estoque_v3_produtos') : null;
+      const arr = savedArr.length > 0 ? savedArr : legacyRaw ? (JSON.parse(legacyRaw) as [string, ProductMaster][]) : [];
+      if (arr.length > 0) {
         const merged = new Map(arr);
         INITIAL_PRODUCTS.forEach((prod, sku) => {
           const existing = merged.get(sku);
           if (!existing) {
             merged.set(sku, prod);
-          } else if (prod.fatorSku > 1 && (existing.fatorSku <= 1 || existing.fatorSku !== prod.fatorSku)) {
-            merged.set(sku, {
-              ...existing,
-              fatorSku: prod.fatorSku,
-              valor: prod.valor > 0 ? prod.valor : existing.valor,
-              valorUnit: prod.valorUnit > 0 ? prod.valorUnit : existing.valorUnit,
-              descricao: prod.descricao || existing.descricao,
-              embalagem: prod.embalagem || existing.embalagem
-            });
           } else {
             merged.set(sku, {
+              ...prod,
               ...existing,
-              valor: prod.valor > 0 ? prod.valor : existing.valor,
-              valorUnit: prod.valorUnit > 0 ? prod.valorUnit : existing.valorUnit,
-              fatorHl: prod.fatorHl > 0 ? prod.fatorHl : (existing.fatorHl || 0),
-              grupo: prod.grupo && prod.grupo !== 'GERAL' ? prod.grupo : (existing.grupo || prod.grupo || 'GERAL'),
-              descricao: prod.descricao || existing.descricao,
-              embalagem: prod.embalagem || existing.embalagem
+              fatorSku: existing.fatorSku > 1 ? existing.fatorSku : prod.fatorSku,
+              valor: existing.valor > 0 ? existing.valor : prod.valor,
+              valorUnit: existing.valorUnit > 0 ? existing.valorUnit : prod.valorUnit,
+              fatorHl: existing.fatorHl > 0 ? existing.fatorHl : (prod.fatorHl || 0),
+              grupo: existing.grupo && existing.grupo !== 'GERAL' ? existing.grupo : (prod.grupo || 'GERAL'),
+              descricao: existing.descricao || prod.descricao,
+              embalagem: existing.embalagem || prod.embalagem,
             });
           }
         });
@@ -160,12 +178,12 @@ export default function App() {
   const [stockPositions, setStockPositions] = useState<StockPositionItem[]>(() => {
     try {
       const v4 = retrieveSync<StockPositionItem[]>(STORAGE_KEYS.STOCK_POSITIONS_020502, []);
-      if (v4 && v4.length > 0) return healStockPositions(v4);
+      if (v4 && v4.length > 0) return healStockPositions(v4, productsMap);
       const v3 = retrieveSync<StockPositionItem[]>(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, []);
-      if (v3 && v3.length > 0) return healStockPositions(v3);
+      if (v3 && v3.length > 0) return healStockPositions(v3, productsMap);
       // Fallback protetivo: se a base de grade de estoque tiver posições da 02.05.02, preserva-as
       const grade = retrieveSync<StockPositionItem[]>(STORAGE_KEYS.GRADE_POSITIONS, []);
-      if (grade && grade.length > 0) return healStockPositions(grade);
+      if (grade && grade.length > 0) return healStockPositions(grade, productsMap);
     } catch (e) {
       console.error('Error loading stock positions:', e);
     }
@@ -178,12 +196,12 @@ export default function App() {
   const [gradeStockPositions, setGradeStockPositions] = useState<StockPositionItem[]>(() => {
     try {
       const v4 = retrieveSync<StockPositionItem[]>(STORAGE_KEYS.GRADE_POSITIONS, []);
-      if (v4 && v4.length > 0) return healStockPositions(v4);
+      if (v4 && v4.length > 0) return healStockPositions(v4, productsMap);
       const v3 = retrieveSync<StockPositionItem[]>(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, []);
-      if (v3 && v3.length > 0) return healStockPositions(v3);
+      if (v3 && v3.length > 0) return healStockPositions(v3, productsMap);
       // Fallback inicial: se a grade ainda não tiver sua 02.05.02 própria mas houver posições na conciliação
       const regular = retrieveSync<StockPositionItem[]>(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, []);
-      if (regular && regular.length > 0) return healStockPositions(regular);
+      if (regular && regular.length > 0) return healStockPositions(regular, productsMap);
     } catch (e) {
       console.error('Error loading grade stock positions:', e);
     }
@@ -209,13 +227,25 @@ export default function App() {
 
   const [quebras, setQuebras] = useState<QuebraItem[]>(() => {
     try {
-      // 1. Prioriza a base higienizada e auditada v4
+      const meta = getLocalSyncMeta();
+      const userAuthored = (meta.quebras?.updatedAt || 0) > 0;
+      const savedFromStore = retrieveSync<QuebraItem[]>(STORAGE_KEYS.QUEBRAS, []);
+      if (meta.quebras?.isExplicitEmpty) {
+        return [];
+      }
+      if (userAuthored && savedFromStore.length > 0) {
+        return markHistoricalQuebrasAsBilled(savedFromStore);
+      }
+
       const savedV4 = localStorage.getItem('gestao_estoque_v4_quebras');
-      let baseList: QuebraItem[] = INITIAL_QUEBRAS;
+      let baseList: QuebraItem[] = savedFromStore.length > 0 ? savedFromStore : INITIAL_QUEBRAS;
 
       if (savedV4) {
         const parsed = JSON.parse(savedV4);
         if (Array.isArray(parsed) && parsed.length > 0) {
+          if (userAuthored) {
+            return markHistoricalQuebrasAsBilled(parsed);
+          }
           const hasDreRaw = parsed.some((q: QuebraItem) => q.id?.startsWith('q-raw-') || q.data === '22/06/2026');
           if (hasDreRaw && parsed.length >= INITIAL_QUEBRAS.length * 0.8) {
             baseList = parsed;
@@ -237,14 +267,12 @@ export default function App() {
         }
       }
 
-      // Garante integridade absoluta do histórico completo + nova semana 08/09 a 12/09
       const completeData = ensureCompleteHistoricalQuebras(baseList);
       const { cleaned } = sanitizeAndDeduplicateQuebras(completeData);
       const billedCleaned = markHistoricalQuebrasAsBilled(cleaned);
 
       safeLocalStorageSet('gestao_estoque_v4_quebras', JSON.stringify(billedCleaned));
       safeLocalStorageSet('gestao_estoque_v4_initialized', 'true');
-
       persistData(STORAGE_KEYS.QUEBRAS, billedCleaned).catch(() => {});
 
       return billedCleaned;
@@ -256,6 +284,10 @@ export default function App() {
 
   const [vales, setVales] = useState<ValeItem[]>(() => {
     try {
+      const meta = getLocalSyncMeta();
+      if (meta.vales?.isExplicitEmpty) return [];
+      const v4 = retrieveSync<ValeItem[]>(STORAGE_KEYS.VALES, []);
+      if (v4.length > 0 || (meta.vales?.updatedAt || 0) > 0) return v4;
       const saved = localStorage.getItem('gestao_estoque_v3_vales');
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -269,11 +301,20 @@ export default function App() {
 
   const [trocas, setTrocas] = useState<TrocaItem[]>(() => {
     try {
+      const meta = getLocalSyncMeta();
+      if (meta.trocas?.isExplicitEmpty) return [];
+      const v4 = retrieveSync<TrocaItem[]>(STORAGE_KEYS.TROCAS, []);
+      if (v4.length > 0 || (meta.trocas?.updatedAt || 0) > 0) {
+        return v4.map((t: TrocaItem) => ({
+          ...t,
+          sku: t.sku || t.codigos,
+          motivo: t.motivo || t.motivoDeclarado || 'Produto Avariado',
+        }));
+      }
       const saved = localStorage.getItem('gestao_estoque_v5_trocas_doc');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          // Normalize trocas to ensure sku, motivo, and faturado status are preserved
           return parsed.map((t: TrocaItem) => ({
             ...t,
             sku: t.sku || t.codigos,
@@ -284,17 +325,20 @@ export default function App() {
     } catch (e) {
       console.error('Error loading trocas:', e);
     }
-    // Clean older caches and initialize with new 118-item base
     try {
       localStorage.removeItem('gestao_estoque_v3_trocas');
       localStorage.removeItem('gestao_estoque_v4_trocas');
-      localStorage.setItem('gestao_estoque_v5_trocas_doc', JSON.stringify(INITIAL_TROCAS));
+      safeLocalStorageSet('gestao_estoque_v5_trocas_doc', JSON.stringify(INITIAL_TROCAS));
     } catch (e) {}
     return INITIAL_TROCAS;
   });
 
   const [faltasMapeadas, setFaltasMapeadas] = useState<FaltaMapeadaItem[]>(() => {
     try {
+      const meta = getLocalSyncMeta();
+      if (meta.faltasMapeadas?.isExplicitEmpty) return [];
+      const v4 = retrieveSync<FaltaMapeadaItem[]>(STORAGE_KEYS.FALTAS, []);
+      if (v4.length > 0 || (meta.faltasMapeadas?.updatedAt || 0) > 0) return v4;
       const saved = localStorage.getItem('gestao_estoque_v3_faltas');
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -308,6 +352,8 @@ export default function App() {
 
   const [frozenReconciliations, setFrozenReconciliations] = useState<FrozenReconciliation[]>(() => {
     try {
+      const v4 = retrieveSync<FrozenReconciliation[]>(STORAGE_KEYS.FROZEN, []);
+      if (v4.length > 0) return v4;
       const saved = localStorage.getItem('gestao_estoque_v3_frozen');
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -435,23 +481,707 @@ export default function App() {
     } catch (e) {}
   };
 
-  // 1. Startup Hydration from high-capacity IndexedDB
-  // Guarantees 02.05.02, manual alterations and state persist across prompt changes and container reboots
+  const latestStateRef = useRef({
+    productsMap,
+    stockPositions,
+    gradeStockPositions,
+    quebras,
+    vales,
+    trocas,
+    faltasMapeadas,
+    frozenReconciliations,
+    weeklyBillingStatus,
+    users,
+  });
+  latestStateRef.current = {
+    productsMap,
+    stockPositions,
+    gradeStockPositions,
+    quebras,
+    vales,
+    trocas,
+    faltasMapeadas,
+    frozenReconciliations,
+    weeklyBillingStatus,
+    users,
+  };
+
+  const formatSyncClock = () =>
+    new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+
+  const scheduleCloudDatasetPush = (
+    datasetKey: SyncDatasetKey,
+    payload: any,
+    updatedAt: number,
+    isExplicitEmpty: boolean = false
+  ) => {
+    if (pushTimersRef.current[datasetKey]) {
+      clearTimeout(pushTimersRef.current[datasetKey]);
+    }
+    if (!isQuotaExceeded()) {
+      setCloudSyncStatus('syncing');
+    }
+
+    pushTimersRef.current[datasetKey] = setTimeout(async () => {
+      const syncMeta = getLocalSyncMeta();
+      try {
+        // Persist in code repository file when running in AI Studio dev environment
+        if (datasetKey === 'stockPositions') {
+          saveToCodeStorage({ type: '020502', stockPositions: payload, syncMeta });
+        } else if (datasetKey === 'gradePositions') {
+          saveToCodeStorage({ type: 'grade', gradeStockPositions: payload, syncMeta });
+        } else if (datasetKey === 'quebras') {
+          saveToCodeStorage({ type: 'quebras', quebras: payload, syncMeta });
+        } else if (datasetKey === 'vales') {
+          saveToCodeStorage({ type: 'vales', vales: payload, syncMeta });
+        } else if (datasetKey === 'trocas') {
+          saveToCodeStorage({ type: 'trocas', trocas: payload, syncMeta });
+        } else if (datasetKey === 'faltasMapeadas') {
+          saveToCodeStorage({ type: 'faltas', faltasMapeadas: payload, syncMeta });
+        } else if (datasetKey === 'frozenReconciliations') {
+          saveToCodeStorage({ type: 'frozen', frozenReconciliations: payload, syncMeta });
+        } else if (datasetKey === 'products') {
+          saveToCodeStorage({ type: 'products', products: payload, syncMeta });
+        } else if (datasetKey === 'weeklyBillingStatus') {
+          saveToCodeStorage({ type: 'billing', weeklyBillingStatus: payload, syncMeta });
+        }
+
+        if (isQuotaExceeded()) {
+          setCloudSyncStatus('local');
+          return;
+        }
+
+        let ok = false;
+        if (datasetKey === 'stockPositions') {
+          ok = await saveStockPositionsToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'gradePositions') {
+          ok = await saveGradePositionsToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'quebras') {
+          ok = await saveQuebrasToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'vales') {
+          ok = await saveValesToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'trocas') {
+          ok = await saveTrocasToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'faltasMapeadas') {
+          ok = await saveFaltasToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'frozenReconciliations') {
+          ok = await saveFrozenReconciliationsSnapshotToFirestore(payload, { updatedAt, isExplicitEmpty });
+        } else if (datasetKey === 'products') {
+          const list = Array.isArray(payload)
+            ? payload.map((entry: any) => (Array.isArray(entry) ? entry[1] : entry))
+            : [];
+          ok = await saveProductsToFirestore(list, { updatedAt });
+        } else if (datasetKey === 'weeklyBillingStatus') {
+          ok = await saveAppSettingsToFirestore('weeklyBillingStatus', payload, { updatedAt });
+        } else if (datasetKey === 'users') {
+          ok = await saveUsersSnapshotToFirestore(payload, { updatedAt });
+        }
+
+        if (ok) {
+          setLastCloudSyncLabel(formatSyncClock());
+          setCloudSyncStatus('synced');
+        } else {
+          setCloudSyncStatus(isQuotaExceeded() ? 'local' : 'synced');
+        }
+      } catch (err) {
+        console.warn(`[Sync] Falha ao enviar ${datasetKey} para nuvem:`, err);
+        setCloudSyncStatus(isQuotaExceeded() ? 'local' : 'synced');
+      }
+    }, 450);
+  };
+
+  // Wrapped Setters: Every user edit/import/delete stamps updatedAt and syncs locally + Cloud + GitHub CodeStorage
+  const updateProductsMap: React.Dispatch<React.SetStateAction<Map<string, ProductMaster>>> = (action) => {
+    setProductsMap((prev) => {
+      const rawNext = typeof action === 'function' ? action(prev) : action;
+      const next = healProductMasterMap(rawNext);
+      const entries = Array.from(next.entries());
+      safeLocalStorageSet('gestao_estoque_v3_produtos', JSON.stringify(entries));
+      persistData(STORAGE_KEYS.PRODUCTS, entries);
+      const stamp = markLocalDatasetMutation('products', entries.length);
+      scheduleCloudDatasetPush('products', entries, stamp.updatedAt);
+      return next;
+    });
+  };
+
+  const updateStockPositions: React.Dispatch<React.SetStateAction<StockPositionItem[]>> = (action) => {
+    setStockPositions((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, next);
+      persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, next);
+      safeLocalStorageSet(STORAGE_KEYS.STOCK_POSITIONS_020502, JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('stockPositions', next.length, isEmpty);
+      scheduleCloudDatasetPush('stockPositions', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateGradeStockPositions: React.Dispatch<React.SetStateAction<StockPositionItem[]>> = (action) => {
+    setGradeStockPositions((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.GRADE_POSITIONS, next);
+      persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, next);
+      safeLocalStorageSet(STORAGE_KEYS.GRADE_POSITIONS, JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('gradePositions', next.length, isEmpty);
+      scheduleCloudDatasetPush('gradePositions', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateQuebras: React.Dispatch<React.SetStateAction<QuebraItem[]>> = (action) => {
+    setQuebras((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.QUEBRAS, next);
+      safeLocalStorageSet(STORAGE_KEYS.QUEBRAS, JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('quebras', next.length, isEmpty);
+      scheduleCloudDatasetPush('quebras', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateVales: React.Dispatch<React.SetStateAction<ValeItem[]>> = (action) => {
+    setVales((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.VALES, next);
+      safeLocalStorageSet(STORAGE_KEYS.VALES, JSON.stringify(next));
+      safeLocalStorageSet('gestao_estoque_v3_vales', JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('vales', next.length, isEmpty);
+      scheduleCloudDatasetPush('vales', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateTrocas: React.Dispatch<React.SetStateAction<TrocaItem[]>> = (action) => {
+    setTrocas((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.TROCAS, next);
+      persistData(STORAGE_KEYS.TROCAS_V4, next);
+      safeLocalStorageSet(STORAGE_KEYS.TROCAS, JSON.stringify(next));
+      safeLocalStorageSet('gestao_estoque_v5_trocas_doc', JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('trocas', next.length, isEmpty);
+      scheduleCloudDatasetPush('trocas', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateFaltasMapeadas: React.Dispatch<React.SetStateAction<FaltaMapeadaItem[]>> = (action) => {
+    setFaltasMapeadas((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.FALTAS, next);
+      safeLocalStorageSet(STORAGE_KEYS.FALTAS, JSON.stringify(next));
+      safeLocalStorageSet('gestao_estoque_v3_faltas', JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('faltasMapeadas', next.length, isEmpty);
+      scheduleCloudDatasetPush('faltasMapeadas', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateFrozenReconciliations: React.Dispatch<React.SetStateAction<FrozenReconciliation[]>> = (action) => {
+    setFrozenReconciliations((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      const isEmpty = next.length === 0;
+      persistData(STORAGE_KEYS.FROZEN, next);
+      safeLocalStorageSet(STORAGE_KEYS.FROZEN, JSON.stringify(next));
+      safeLocalStorageSet('gestao_estoque_v3_frozen', JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('frozenReconciliations', next.length, isEmpty);
+      scheduleCloudDatasetPush('frozenReconciliations', next, stamp.updatedAt, isEmpty);
+      return next;
+    });
+  };
+
+  const updateWeeklyBillingStatus: React.Dispatch<React.SetStateAction<Record<string, 'PENDENTE' | 'OK'>>> = (action) => {
+    setWeeklyBillingStatus((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      persistData(STORAGE_KEYS.WEEKLY_BILLING, next);
+      safeLocalStorageSet(STORAGE_KEYS.WEEKLY_BILLING, JSON.stringify(next));
+      const stamp = markLocalDatasetMutation('weeklyBillingStatus', Object.keys(next || {}).length);
+      scheduleCloudDatasetPush('weeklyBillingStatus', next, stamp.updatedAt);
+      return next;
+    });
+  };
+
+  const updateUsers: React.Dispatch<React.SetStateAction<UserAccount[]>> = (action) => {
+    setUsers((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      safeLocalStorageSet('gestao_estoque_v3_usuarios', JSON.stringify(next));
+      persistData(STORAGE_KEYS.USERS, next);
+      const stamp = markLocalDatasetMutation('users', next.length);
+      scheduleCloudDatasetPush('users', next, stamp.updatedAt);
+      return next;
+    });
+  };
+
+  // Bidirectional Timestamped Cloud Reconciliation (AI Studio <-> GitHub Pages)
+  const reconcileWithCloud = async (
+    incomingMeta?: WorkspaceSyncMeta,
+    isManualTrigger: boolean = false
+  ) => {
+    if (!isHydratedRef.current) return;
+    if (isQuotaExceeded()) {
+      setCloudSyncStatus('local');
+      return;
+    }
+    if (isSyncingCloudRef.current) {
+      if (incomingMeta) {
+        pendingRemoteMetaRef.current = incomingMeta;
+      }
+      return;
+    }
+
+    isSyncingCloudRef.current = true;
+    setCloudSyncStatus('syncing');
+
+    try {
+      const cloudMeta = incomingMeta ?? (await loadWorkspaceMetaFromFirestore());
+      if (isQuotaExceeded()) {
+        setCloudSyncStatus('local');
+        return;
+      }
+
+      const localMeta = getLocalSyncMeta();
+      const myClientId = getOrCreateClientId();
+      const cur = latestStateRef.current;
+      let activeProductsMap = cur.productsMap;
+
+      // Ignore live echo of our own client write unless manually triggered
+      const isEchoOnly =
+        Boolean(incomingMeta) &&
+        !isManualTrigger &&
+        Object.keys(cloudMeta).every((k) => {
+          const key = k as SyncDatasetKey;
+          const cStamp = cloudMeta[key];
+          const lStamp = localMeta[key];
+          if (!cStamp) return true;
+          if (cStamp.clientId === myClientId && cStamp.updatedAt <= (lStamp?.updatedAt || 0)) {
+            return true;
+          }
+          return cStamp.updatedAt <= (lStamp?.updatedAt || 0);
+        });
+
+      if (isEchoOnly) {
+        setCloudSyncStatus('synced');
+        return;
+      }
+
+      // 1. Products Catalog (sync first so stock healing uses up-to-date catalog)
+      {
+        const lStamp = localMeta.products;
+        const cStamp = cloudMeta.products;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadProductsSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && res.items.length > 0 && effTs > localTs) {
+            const nextMap = new Map(activeProductsMap);
+            res.items.forEach((cp) => {
+              const code = cp?.codigo || (cp as any)?.sku;
+              if (code) {
+                const existing = nextMap.get(code);
+                nextMap.set(code, { ...existing, ...cp, codigo: code });
+              }
+            });
+            activeProductsMap = healProductMasterMap(nextMap);
+            const entries = Array.from(activeProductsMap.entries());
+            setProductsMap(activeProductsMap);
+            persistData(STORAGE_KEYS.PRODUCTS, entries);
+            safeLocalStorageSet('gestao_estoque_v3_produtos', JSON.stringify(entries));
+            const appliedStamp = cStamp || { updatedAt: effTs, count: entries.length, clientId: 'cloud' };
+            setLocalDatasetStamp('products', appliedStamp);
+            saveToCodeStorage({ type: 'products', products: entries, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && localTs > 0 && activeProductsMap.size > 0) {
+            await saveProductsToFirestore(Array.from(activeProductsMap.values()), { updatedAt: localTs });
+          }
+        } else if (localTs > cloudTs && activeProductsMap.size > 0) {
+          await saveProductsToFirestore(Array.from(activeProductsMap.values()), { updatedAt: localTs });
+        }
+      }
+
+      // 2. Stock Positions (02.05.02 Conciliação)
+      {
+        const lStamp = localMeta.stockPositions;
+        const cStamp = cloudMeta.stockPositions;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        const localNeedsHeal = !lStamp?.isExplicitEmpty && (lStamp?.count || 0) > 0 && cur.stockPositions.length === 0;
+        if (cloudTs > localTs || localNeedsHeal || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadStockPositionsSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          const shouldApplyCloud =
+            res.exists &&
+            (effTs > localTs ||
+              localNeedsHeal ||
+              (localTs === 0 && cur.stockPositions.length === 0 && res.items.length > 0));
+          if (shouldApplyCloud) {
+            const nextStock = res.isExplicitEmpty ? [] : healStockPositions(res.items, activeProductsMap);
+            setStockPositions(nextStock);
+            persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, nextStock);
+            persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, nextStock);
+            safeLocalStorageSet(STORAGE_KEYS.STOCK_POSITIONS_020502, JSON.stringify(nextStock));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs || Date.now(),
+              count: nextStock.length,
+              clientId: 'cloud',
+              isExplicitEmpty: res.isExplicitEmpty,
+            };
+            setLocalDatasetStamp('stockPositions', appliedStamp);
+            saveToCodeStorage({ type: '020502', stockPositions: nextStock, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && cur.stockPositions.length > 0) {
+            await saveStockPositionsToFirestore(cur.stockPositions, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && (cur.stockPositions.length > 0 || lStamp?.isExplicitEmpty)) {
+          await saveStockPositionsToFirestore(cur.stockPositions, {
+            updatedAt: localTs,
+            isExplicitEmpty: lStamp?.isExplicitEmpty,
+          });
+        } else if (!cStamp && cur.stockPositions.length > 0) {
+          await saveStockPositionsToFirestore(cur.stockPositions, { updatedAt: localTs || Date.now() });
+        }
+      }
+
+      // 3. Grade de Estoque (02.05.02 da Grade)
+      {
+        const lStamp = localMeta.gradePositions;
+        const cStamp = cloudMeta.gradePositions;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        const localNeedsHeal = !lStamp?.isExplicitEmpty && (lStamp?.count || 0) > 0 && cur.gradeStockPositions.length === 0;
+        if (cloudTs > localTs || localNeedsHeal || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadGradePositionsSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          const shouldApplyCloud =
+            res.exists &&
+            (effTs > localTs ||
+              localNeedsHeal ||
+              (localTs === 0 && cur.gradeStockPositions.length === 0 && res.items.length > 0));
+          if (shouldApplyCloud) {
+            const nextGrade = res.isExplicitEmpty ? [] : healStockPositions(res.items, activeProductsMap);
+            setGradeStockPositions(nextGrade);
+            persistData(STORAGE_KEYS.GRADE_POSITIONS, nextGrade);
+            persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, nextGrade);
+            safeLocalStorageSet(STORAGE_KEYS.GRADE_POSITIONS, JSON.stringify(nextGrade));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs || Date.now(),
+              count: nextGrade.length,
+              clientId: 'cloud',
+              isExplicitEmpty: res.isExplicitEmpty,
+            };
+            setLocalDatasetStamp('gradePositions', appliedStamp);
+            saveToCodeStorage({ type: 'grade', gradeStockPositions: nextGrade, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && cur.gradeStockPositions.length > 0) {
+            await saveGradePositionsToFirestore(cur.gradeStockPositions, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && (cur.gradeStockPositions.length > 0 || lStamp?.isExplicitEmpty)) {
+          await saveGradePositionsToFirestore(cur.gradeStockPositions, {
+            updatedAt: localTs,
+            isExplicitEmpty: lStamp?.isExplicitEmpty,
+          });
+        } else if (!cStamp && cur.gradeStockPositions.length > 0) {
+          await saveGradePositionsToFirestore(cur.gradeStockPositions, { updatedAt: localTs || Date.now() });
+        }
+      }
+
+      // 4. Quebras
+      {
+        const lStamp = localMeta.quebras;
+        const cStamp = cloudMeta.quebras;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadQuebrasSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && effTs > localTs) {
+            const nextQuebras = res.isExplicitEmpty ? [] : markHistoricalQuebrasAsBilled(res.items);
+            setQuebras(nextQuebras);
+            persistData(STORAGE_KEYS.QUEBRAS, nextQuebras);
+            safeLocalStorageSet(STORAGE_KEYS.QUEBRAS, JSON.stringify(nextQuebras));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs,
+              count: nextQuebras.length,
+              clientId: 'cloud',
+              isExplicitEmpty: res.isExplicitEmpty,
+            };
+            setLocalDatasetStamp('quebras', appliedStamp);
+            saveToCodeStorage({ type: 'quebras', quebras: nextQuebras, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && cur.quebras.length > 0) {
+            await saveQuebrasToFirestore(cur.quebras, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && (cur.quebras.length > 0 || lStamp?.isExplicitEmpty)) {
+          await saveQuebrasToFirestore(cur.quebras, {
+            updatedAt: localTs,
+            isExplicitEmpty: lStamp?.isExplicitEmpty,
+          });
+        }
+      }
+
+      // 5. Vales
+      {
+        const lStamp = localMeta.vales;
+        const cStamp = cloudMeta.vales;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadValesSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && effTs > localTs) {
+            const nextVales = res.isExplicitEmpty ? [] : res.items;
+            setVales(nextVales);
+            persistData(STORAGE_KEYS.VALES, nextVales);
+            safeLocalStorageSet(STORAGE_KEYS.VALES, JSON.stringify(nextVales));
+            safeLocalStorageSet('gestao_estoque_v3_vales', JSON.stringify(nextVales));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs,
+              count: nextVales.length,
+              clientId: 'cloud',
+              isExplicitEmpty: res.isExplicitEmpty,
+            };
+            setLocalDatasetStamp('vales', appliedStamp);
+            saveToCodeStorage({ type: 'vales', vales: nextVales, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && cur.vales.length > 0) {
+            await saveValesToFirestore(cur.vales, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && (cur.vales.length > 0 || lStamp?.isExplicitEmpty)) {
+          await saveValesToFirestore(cur.vales, {
+            updatedAt: localTs,
+            isExplicitEmpty: lStamp?.isExplicitEmpty,
+          });
+        }
+      }
+
+      // 6. Trocas
+      {
+        const lStamp = localMeta.trocas;
+        const cStamp = cloudMeta.trocas;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadTrocasSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && effTs > localTs) {
+            const nextTrocas = res.isExplicitEmpty
+              ? []
+              : res.items.map((t) => ({
+                  ...t,
+                  sku: t.sku || t.codigos,
+                  motivo: t.motivo || t.motivoDeclarado || 'Produto Avariado',
+                }));
+            setTrocas(nextTrocas);
+            persistData(STORAGE_KEYS.TROCAS, nextTrocas);
+            persistData(STORAGE_KEYS.TROCAS_V4, nextTrocas);
+            safeLocalStorageSet(STORAGE_KEYS.TROCAS, JSON.stringify(nextTrocas));
+            safeLocalStorageSet('gestao_estoque_v5_trocas_doc', JSON.stringify(nextTrocas));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs,
+              count: nextTrocas.length,
+              clientId: 'cloud',
+              isExplicitEmpty: res.isExplicitEmpty,
+            };
+            setLocalDatasetStamp('trocas', appliedStamp);
+            saveToCodeStorage({ type: 'trocas', trocas: nextTrocas, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && cur.trocas.length > 0) {
+            await saveTrocasToFirestore(cur.trocas, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && (cur.trocas.length > 0 || lStamp?.isExplicitEmpty)) {
+          await saveTrocasToFirestore(cur.trocas, {
+            updatedAt: localTs,
+            isExplicitEmpty: lStamp?.isExplicitEmpty,
+          });
+        }
+      }
+
+      // 7. Faltas Mapeadas
+      {
+        const lStamp = localMeta.faltasMapeadas;
+        const cStamp = cloudMeta.faltasMapeadas;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadFaltasSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && effTs > localTs) {
+            const nextFaltas = res.isExplicitEmpty ? [] : res.items;
+            setFaltasMapeadas(nextFaltas);
+            persistData(STORAGE_KEYS.FALTAS, nextFaltas);
+            safeLocalStorageSet(STORAGE_KEYS.FALTAS, JSON.stringify(nextFaltas));
+            safeLocalStorageSet('gestao_estoque_v3_faltas', JSON.stringify(nextFaltas));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs,
+              count: nextFaltas.length,
+              clientId: 'cloud',
+              isExplicitEmpty: res.isExplicitEmpty,
+            };
+            setLocalDatasetStamp('faltasMapeadas', appliedStamp);
+            saveToCodeStorage({ type: 'faltas', faltasMapeadas: nextFaltas, syncMeta: getLocalSyncMeta() });
+          } else if (!res.exists && cur.faltasMapeadas.length > 0) {
+            await saveFaltasToFirestore(cur.faltasMapeadas, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && (cur.faltasMapeadas.length > 0 || lStamp?.isExplicitEmpty)) {
+          await saveFaltasToFirestore(cur.faltasMapeadas, {
+            updatedAt: localTs,
+            isExplicitEmpty: lStamp?.isExplicitEmpty,
+          });
+        }
+      }
+
+      // 8. Fechamentos Congelados
+      {
+        const lStamp = localMeta.frozenReconciliations;
+        const cStamp = cloudMeta.frozenReconciliations;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadFrozenSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && res.items.length > 0 && effTs > localTs) {
+            setFrozenReconciliations(res.items);
+            persistData(STORAGE_KEYS.FROZEN, res.items);
+            safeLocalStorageSet(STORAGE_KEYS.FROZEN, JSON.stringify(res.items));
+            safeLocalStorageSet('gestao_estoque_v3_frozen', JSON.stringify(res.items));
+            const appliedStamp = cStamp || { updatedAt: effTs, count: res.items.length, clientId: 'cloud' };
+            setLocalDatasetStamp('frozenReconciliations', appliedStamp);
+            saveToCodeStorage({
+              type: 'frozen',
+              frozenReconciliations: res.items,
+              syncMeta: getLocalSyncMeta(),
+            });
+          } else if (!res.exists && cur.frozenReconciliations.length > 0) {
+            await saveFrozenReconciliationsSnapshotToFirestore(cur.frozenReconciliations, {
+              updatedAt: localTs || Date.now(),
+            });
+          }
+        } else if (localTs > cloudTs && cur.frozenReconciliations.length > 0) {
+          await saveFrozenReconciliationsSnapshotToFirestore(cur.frozenReconciliations, {
+            updatedAt: localTs,
+          });
+        }
+      }
+
+      // 9. Status de Faturamento Semanal
+      {
+        const lStamp = localMeta.weeklyBillingStatus;
+        const cStamp = cloudMeta.weeklyBillingStatus;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadAppSettingsDetailedFromFirestore<Record<string, 'PENDENTE' | 'OK'>>(
+            'weeklyBillingStatus'
+          );
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.value && Object.keys(res.value).length > 0 && effTs > localTs) {
+            const mergedBilling = { ...cur.weeklyBillingStatus, ...res.value };
+            setWeeklyBillingStatus(mergedBilling);
+            persistData(STORAGE_KEYS.WEEKLY_BILLING, mergedBilling);
+            safeLocalStorageSet(STORAGE_KEYS.WEEKLY_BILLING, JSON.stringify(mergedBilling));
+            const appliedStamp = cStamp || {
+              updatedAt: effTs,
+              count: Object.keys(mergedBilling).length,
+              clientId: 'cloud',
+            };
+            setLocalDatasetStamp('weeklyBillingStatus', appliedStamp);
+            saveToCodeStorage({
+              type: 'billing',
+              weeklyBillingStatus: mergedBilling,
+              syncMeta: getLocalSyncMeta(),
+            });
+          } else if (!res.value && cur.weeklyBillingStatus) {
+            await saveAppSettingsToFirestore('weeklyBillingStatus', cur.weeklyBillingStatus, {
+              updatedAt: localTs || Date.now(),
+            });
+          }
+        } else if (localTs > cloudTs && cur.weeklyBillingStatus) {
+          await saveAppSettingsToFirestore('weeklyBillingStatus', cur.weeklyBillingStatus, {
+            updatedAt: localTs,
+          });
+        }
+      }
+
+      // 10. Usuários
+      {
+        const lStamp = localMeta.users;
+        const cStamp = cloudMeta.users;
+        const localTs = lStamp?.updatedAt || 0;
+        const cloudTs = cStamp?.updatedAt || 0;
+        if (cloudTs > localTs || (!incomingMeta && cloudTs === 0 && localTs === 0)) {
+          const res = await loadUsersSnapshotDetailed();
+          const effTs = Math.max(cloudTs, res.updatedAt || 0);
+          if (res.exists && res.items.length > 0 && effTs > localTs) {
+            setUsers((prev) => {
+              const merged = [...prev];
+              res.items.forEach((cu) => {
+                const idx = merged.findIndex((m) => m.id === cu.id || m.matricula === cu.matricula);
+                if (idx >= 0) {
+                  merged[idx] = { ...merged[idx], ...cu };
+                } else {
+                  merged.push(cu);
+                }
+              });
+              safeLocalStorageSet('gestao_estoque_v3_usuarios', JSON.stringify(merged));
+              persistData(STORAGE_KEYS.USERS, merged);
+              return merged;
+            });
+            setLocalDatasetStamp('users', cStamp || { updatedAt: effTs, count: res.items.length, clientId: 'cloud' });
+          } else if (!res.exists && cur.users.length > 0) {
+            await saveUsersSnapshotToFirestore(cur.users, { updatedAt: localTs || Date.now() });
+          }
+        } else if (localTs > cloudTs && cur.users.length > 0) {
+          await saveUsersSnapshotToFirestore(cur.users, { updatedAt: localTs });
+        }
+      }
+
+      setLastCloudSyncLabel(formatSyncClock());
+      setCloudSyncStatus(isQuotaExceeded() ? 'local' : 'synced');
+
+      if (isManualTrigger && !isQuotaExceeded()) {
+        setToastMessage({
+          type: 'success',
+          text: 'Sincronização completa entre plataforma e nuvem (GitHub Pages / AI Studio) concluída sem erros.',
+        });
+      }
+    } catch (err) {
+      console.warn('[Firebase] Aviso na sincronização automática:', err);
+      setCloudSyncStatus(isQuotaExceeded() ? 'local' : 'synced');
+    } finally {
+      isSyncingCloudRef.current = false;
+      if (pendingRemoteMetaRef.current) {
+        const queued = pendingRemoteMetaRef.current;
+        pendingRemoteMetaRef.current = null;
+        reconcileWithCloud(queued);
+      }
+    }
+  };
+
+  const handleForceCloudSync = async () => {
+    if (isQuotaExceeded()) {
+      await clearQuotaExceededAndReconnect();
+      setIsQuotaWarningVisible(false);
+    }
+    await reconcileWithCloud(undefined, true);
+  };
+
+  // 1. Startup Hydration from IndexedDB -> Followed Immediately by Cloud Sync + Real-Time Listener
   useEffect(() => {
     let isMounted = true;
-    async function hydrateFromPersistentStorage() {
+    let unsubscribeMeta: (() => void) | null = null;
+
+    async function hydrateAndStartCloudSync() {
       try {
         const [
-          savedStock, 
-          savedGrade, 
-          savedQuebras, 
-          savedVales, 
-          savedTrocas, 
-          savedFaltas, 
-          savedFrozen, 
-          savedUser, 
+          savedStock,
+          savedGrade,
+          savedQuebras,
+          savedVales,
+          savedTrocas,
+          savedFaltas,
+          savedFrozen,
+          savedUser,
           savedBilling,
-          savedProducts
+          savedProducts,
         ] = await Promise.all([
           retrieveData<StockPositionItem[]>(STORAGE_KEYS.STOCK_POSITIONS_020502, []),
           retrieveData<StockPositionItem[]>(STORAGE_KEYS.GRADE_POSITIONS, []),
@@ -462,10 +1192,11 @@ export default function App() {
           retrieveData<FrozenReconciliation[]>(STORAGE_KEYS.FROZEN, []),
           retrieveData<UserAccount | null>(STORAGE_KEYS.ACTIVE_USER, null),
           retrieveData<Record<string, 'PENDENTE' | 'OK'> | null>(STORAGE_KEYS.WEEKLY_BILLING, null),
-          retrieveData<[string, ProductMaster][]>(STORAGE_KEYS.PRODUCTS, [])
+          retrieveData<[string, ProductMaster][]>(STORAGE_KEYS.PRODUCTS, []),
         ]);
 
         if (!isMounted) return;
+        const localMeta = getLocalSyncMeta();
 
         let currentProductsMap: Map<string, ProductMaster>;
         if (savedProducts && savedProducts.length > 0) {
@@ -474,21 +1205,17 @@ export default function App() {
             const existing = merged.get(sku);
             if (!existing) {
               merged.set(sku, prod);
-            } else if (prod.fatorSku > 1 && (existing.fatorSku <= 1 || existing.fatorSku !== prod.fatorSku)) {
+            } else {
               merged.set(sku, {
+                ...prod,
                 ...existing,
-                fatorSku: prod.fatorSku,
-                valor: prod.valor > 0 ? prod.valor : existing.valor,
-                valorUnit: prod.valorUnit > 0 ? prod.valorUnit : existing.valorUnit,
-                descricao: prod.descricao || existing.descricao,
-                embalagem: prod.embalagem || existing.embalagem
-              });
-            } else if (prod.valor > 0 && prod.valor !== existing.valor) {
-              merged.set(sku, {
-                ...existing,
-                valor: prod.valor,
-                valorUnit: prod.valorUnit,
-                descricao: prod.descricao || existing.descricao
+                fatorSku: existing.fatorSku > 1 ? existing.fatorSku : prod.fatorSku,
+                valor: existing.valor > 0 ? existing.valor : prod.valor,
+                valorUnit: existing.valorUnit > 0 ? existing.valorUnit : prod.valorUnit,
+                fatorHl: existing.fatorHl > 0 ? existing.fatorHl : (prod.fatorHl || 0),
+                grupo: existing.grupo && existing.grupo !== 'GERAL' ? existing.grupo : (prod.grupo || 'GERAL'),
+                descricao: existing.descricao || prod.descricao,
+                embalagem: existing.embalagem || prod.embalagem,
               });
             }
           });
@@ -499,56 +1226,79 @@ export default function App() {
           setProductsMap(currentProductsMap);
         }
 
-        if (savedStock && savedStock.length > 0) {
+        if (localMeta.stockPositions?.isExplicitEmpty) {
+          setStockPositions([]);
+        } else if (savedStock && savedStock.length > 0) {
           const healedStock = healStockPositions(savedStock, currentProductsMap);
           setStockPositions(healedStock);
           persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, healedStock);
           persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, healedStock);
-        } else if (savedGrade && savedGrade.length > 0) {
-          // Se a base da conciliação estiver vazia mas a base da Grade tiver a 02.05.02 importada, sincroniza
-          const healedStock = healStockPositions(savedGrade, currentProductsMap);
-          setStockPositions(healedStock);
-          persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, healedStock);
-          persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, healedStock);
-        } else if (savedGrade && savedGrade.length > 0) {
-          // Se a base da conciliação estiver vazia mas a base da Grade tiver a 02.05.02 importada, sincroniza
+        } else if (savedGrade && savedGrade.length > 0 && !localMeta.stockPositions?.updatedAt) {
           const healedStock = healStockPositions(savedGrade, currentProductsMap);
           setStockPositions(healedStock);
           persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, healedStock);
           persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, healedStock);
         }
-        if (savedGrade && savedGrade.length > 0) {
+
+        if (localMeta.gradePositions?.isExplicitEmpty) {
+          setGradeStockPositions([]);
+        } else if (savedGrade && savedGrade.length > 0) {
           const healedGrade = healStockPositions(savedGrade, currentProductsMap);
           setGradeStockPositions(healedGrade);
           persistData(STORAGE_KEYS.GRADE_POSITIONS, healedGrade);
           persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, healedGrade);
         }
-        if (savedQuebras && savedQuebras.length > 0) {
-          const hasDreRaw = savedQuebras.some((q: QuebraItem) => q.id?.startsWith('q-raw-') || q.data === '22/06/2026');
-          if (hasDreRaw && savedQuebras.length >= INITIAL_QUEBRAS.length * 0.8) {
-            setQuebras(savedQuebras);
+
+        if (localMeta.quebras?.isExplicitEmpty) {
+          setQuebras([]);
+        } else if (savedQuebras && savedQuebras.length > 0) {
+          if ((localMeta.quebras?.updatedAt || 0) > 0) {
+            setQuebras(markHistoricalQuebrasAsBilled(savedQuebras));
           } else {
-            const filteredOld = savedQuebras.filter((q: QuebraItem) => !q.id?.startsWith('q-jul-') && q.id !== 'q-sem-2906' && q.id !== 'q-sem-2306');
-            const existingIds = new Set(filteredOld.map((q: QuebraItem) => q.id));
-            const missing = INITIAL_QUEBRAS.filter(q => !existingIds.has(q.id));
-            const merged = [...filteredOld, ...missing];
-            const guaranteed = ensureCompleteHistoricalQuebras(merged);
-            const { cleaned } = sanitizeAndDeduplicateQuebras(guaranteed);
-            const billedCleaned = markHistoricalQuebrasAsBilled(cleaned);
-            setQuebras(billedCleaned);
-            persistData(STORAGE_KEYS.QUEBRAS, billedCleaned);
-            safeLocalStorageSet('gestao_estoque_v4_quebras', JSON.stringify(billedCleaned));
+            const hasDreRaw = savedQuebras.some(
+              (q: QuebraItem) => q.id?.startsWith('q-raw-') || q.data === '22/06/2026'
+            );
+            if (hasDreRaw && savedQuebras.length >= INITIAL_QUEBRAS.length * 0.8) {
+              setQuebras(savedQuebras);
+            } else {
+              const filteredOld = savedQuebras.filter(
+                (q: QuebraItem) =>
+                  !q.id?.startsWith('q-jul-') && q.id !== 'q-sem-2906' && q.id !== 'q-sem-2306'
+              );
+              const existingIds = new Set(filteredOld.map((q: QuebraItem) => q.id));
+              const missing = INITIAL_QUEBRAS.filter((q) => !existingIds.has(q.id));
+              const merged = [...filteredOld, ...missing];
+              const guaranteed = ensureCompleteHistoricalQuebras(merged);
+              const { cleaned } = sanitizeAndDeduplicateQuebras(guaranteed);
+              const billedCleaned = markHistoricalQuebrasAsBilled(cleaned);
+              setQuebras(billedCleaned);
+              persistData(STORAGE_KEYS.QUEBRAS, billedCleaned);
+              safeLocalStorageSet('gestao_estoque_v4_quebras', JSON.stringify(billedCleaned));
+            }
           }
         }
-        if (savedVales && savedVales.length > 0) {
+
+        if (localMeta.vales?.isExplicitEmpty) {
+          setVales([]);
+        } else if (savedVales && (savedVales.length > 0 || (localMeta.vales?.updatedAt || 0) > 0)) {
           setVales(savedVales);
         }
-        if (savedTrocas && savedTrocas.length > 0) {
+
+        if (localMeta.trocas?.isExplicitEmpty) {
+          setTrocas([]);
+        } else if (savedTrocas && (savedTrocas.length > 0 || (localMeta.trocas?.updatedAt || 0) > 0)) {
           setTrocas(savedTrocas);
         }
-        if (savedFaltas && savedFaltas.length > 0) {
+
+        if (localMeta.faltasMapeadas?.isExplicitEmpty) {
+          setFaltasMapeadas([]);
+        } else if (
+          savedFaltas &&
+          (savedFaltas.length > 0 || (localMeta.faltasMapeadas?.updatedAt || 0) > 0)
+        ) {
           setFaltasMapeadas(savedFaltas);
         }
+
         if (savedFrozen && savedFrozen.length > 0) {
           setFrozenReconciliations(savedFrozen);
         }
@@ -556,31 +1306,46 @@ export default function App() {
           setCurrentUser(savedUser);
         }
         if (savedBilling) {
-          setWeeklyBillingStatus(prev => ({ ...prev, ...savedBilling }));
+          setWeeklyBillingStatus((prev) => ({ ...prev, ...savedBilling }));
         }
       } catch (err) {
         console.warn('[PersistentStorage] Hydration completed with notes:', err);
       } finally {
         if (isMounted) {
           isHydratedRef.current = true;
+          // Allow React state updates from IndexedDB to commit, then reconcile with Firestore & subscribe live
+          setTimeout(() => {
+            if (!isMounted) return;
+            reconcileWithCloud().then(() => {
+              if (!isMounted) return;
+              unsubscribeMeta = subscribeToWorkspaceMeta((remoteMeta) => {
+                if (!isMounted) return;
+                reconcileWithCloud(remoteMeta);
+              });
+            });
+          }, 80);
         }
       }
     }
 
-    hydrateFromPersistentStorage();
+    hydrateAndStartCloudSync();
+
+    // Also reconcile whenever browser tab regains focus (e.g. switching between AI Studio and GitHub Pages tabs)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && isHydratedRef.current && !isQuotaExceeded()) {
+        reconcileWithCloud();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
     return () => {
       isMounted = false;
+      document.removeEventListener('visibilitychange', handleVisibility);
+      if (unsubscribeMeta) unsubscribeMeta();
     };
   }, []);
 
-  // Save to persistent storage and cloud
-  useEffect(() => {
-    try {
-      localStorage.setItem('gestao_estoque_v3_usuarios', JSON.stringify(users));
-      persistData(STORAGE_KEYS.USERS, users);
-    } catch (e) {}
-  }, [users]);
-
+  // Keep Active User session synced locally
   useEffect(() => {
     try {
       if (currentUser) {
@@ -595,305 +1360,62 @@ export default function App() {
     } catch (e) {}
   }, [currentUser]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem('gestao_estoque_v3_produtos', JSON.stringify(Array.from(productsMap.entries())));
-    } catch (e) {}
-    persistData(STORAGE_KEYS.PRODUCTS, Array.from(productsMap.entries()));
-  }, [productsMap]);
-
-  // Persist 02.05.02 (Conciliação) with alterations immediately
-  useEffect(() => {
-    // PROTEÇÃO CRÍTICA: Não sobrescrever o banco com array vazio durante a montagem/hidratação inicial!
-    if (!isHydratedRef.current && stockPositions.length === 0) return;
-    if (stockPositions.length === 0 && !isExplicitResetRef.current) return;
-
-    persistData(STORAGE_KEYS.STOCK_POSITIONS_020502, stockPositions);
-    persistData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY, stockPositions);
-    safeLocalStorageSet(STORAGE_KEYS.STOCK_POSITIONS_020502, JSON.stringify(stockPositions));
-
-    if (!isInitialMountRef.current && stockPositions.length > 0 && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveStockPositionsToFirestore(stockPositions).catch((err) => 
-            console.warn('[Firebase] Sync stockPositions warning:', err)
-          );
-        }
-      }, 3000);
-      return () => clearTimeout(timer);
-    }
-  }, [stockPositions]);
-
-  // Persist 02.05.02 (Grade de Estoque) immediately
-  useEffect(() => {
-    if (!isHydratedRef.current && gradeStockPositions.length === 0) return;
-    if (gradeStockPositions.length === 0 && !isExplicitResetRef.current) return;
-
-    persistData(STORAGE_KEYS.GRADE_POSITIONS, gradeStockPositions);
-    persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, gradeStockPositions);
-    safeLocalStorageSet(STORAGE_KEYS.GRADE_POSITIONS, JSON.stringify(gradeStockPositions));
-
-    if (!isInitialMountRef.current && gradeStockPositions.length > 0 && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveGradePositionsToFirestore(gradeStockPositions).catch((err) => 
-            console.warn('[Firebase] Sync gradePositions warning:', err)
-          );
-        }
-      }, 3000);
-      return () => clearTimeout(timer);
-    }
-  }, [gradeStockPositions]);
-
-  useEffect(() => {
-    persistData(STORAGE_KEYS.QUEBRAS, quebras);
-    if (!isInitialMountRef.current && quebras.length > 0 && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveQuebrasToFirestore(quebras).catch((err) => 
-            console.warn('[Firebase] Sync quebras warning:', err)
-          );
-        }
-      }, 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [quebras]);
-
-  useEffect(() => {
-    persistData(STORAGE_KEYS.WEEKLY_BILLING, weeklyBillingStatus);
-    if (!isInitialMountRef.current && weeklyBillingStatus && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveAppSettingsToFirestore('weeklyBillingStatus', weeklyBillingStatus).catch((err) =>
-            console.warn('[Firebase] Sync weeklyBilling warning:', err)
-          );
-        }
-      }, 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [weeklyBillingStatus]);
-
-  useEffect(() => {
-    persistData(STORAGE_KEYS.VALES, vales);
-    if (!isInitialMountRef.current && vales.length > 0 && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveValesToFirestore(vales).catch((err) => 
-            console.warn('[Firebase] Sync vales warning:', err)
-          );
-        }
-      }, 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [vales]);
-
-  useEffect(() => {
-    persistData(STORAGE_KEYS.TROCAS, trocas);
-    persistData(STORAGE_KEYS.TROCAS_V4, trocas);
-    if (!isInitialMountRef.current && trocas.length > 0 && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveTrocasToFirestore(trocas).catch((err) => 
-            console.warn('[Firebase] Sync trocas warning:', err)
-          );
-        }
-      }, 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [trocas]);
-
-  useEffect(() => {
-    persistData(STORAGE_KEYS.FALTAS, faltasMapeadas);
-    if (!isInitialMountRef.current && faltasMapeadas.length > 0 && !isQuotaExceeded()) {
-      const timer = setTimeout(() => {
-        if (!isQuotaExceeded()) {
-          saveFaltasToFirestore(faltasMapeadas).catch((err) => 
-            console.warn('[Firebase] Sync faltas warning:', err)
-          );
-        }
-      }, 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [faltasMapeadas]);
-
-  useEffect(() => {
-    persistData(STORAGE_KEYS.FROZEN, frozenReconciliations);
-  }, [frozenReconciliations]);
-
-  // Sincronização automática contínua com o Firebase Firestore
-  // Permite que qualquer alteração do Studio IA suba para a nuvem
-  // e que o link do GitHub Pages puxe 100% dos dados na inicialização
-  useEffect(() => {
-    let isMounted = true;
-
-    async function executeCloudSync() {
-      // Se a cota do Firestore já estiver excedida, ignora o pooling remoto para evitar sobrecarga
-      if (isQuotaExceeded()) {
-        console.warn('[Firebase] Sincronização em nuvem pausada temporariamente: Cota diária do Firestore atingida.');
-        return;
-      }
-
-      try {
-        const cloudStock = await loadStockPositionsFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudGrade = await loadGradePositionsFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudQuebras = await loadQuebrasFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudVales = await loadValesFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudTrocas = await loadTrocasFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudFaltas = await loadFaltasFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudFrozen = await loadFrozenReconciliationsFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudUsers = await loadUsersFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudProducts = await loadProductsFromFirestore().catch(() => []);
-        if (isQuotaExceeded() || !isMounted) return;
-
-        const cloudBilling = await loadAppSettingsFromFirestore<Record<string, 'PENDENTE' | 'OK'>>('weeklyBillingStatus').catch(() => null);
-        if (!isMounted) return;
-
-        // 1. Posições de Estoque (02.05.02) - Preserva a base local importada pelo usuário!
-        if (cloudStock && cloudStock.length > 0) {
-          setStockPositions(prev => (prev && prev.length > 0 ? prev : cloudStock));
-        }
-
-        // 2. Grade de Estoque (02.05.02) - Preserva a base local importada pelo usuário!
-        if (cloudGrade && cloudGrade.length > 0) {
-          setGradeStockPositions(prev => (prev && prev.length > 0 ? prev : cloudGrade));
-        }
-
-        // 3. Quebras
-        if (cloudQuebras && cloudQuebras.length > 0) {
-          const { cleaned } = sanitizeAndDeduplicateQuebras(cloudQuebras);
-          setQuebras(cleaned);
-        }
-
-        // 4. Vales
-        if (cloudVales && cloudVales.length > 0) {
-          setVales(cloudVales);
-        }
-
-        // 5. Trocas
-        if (cloudTrocas && cloudTrocas.length > 0) {
-          setTrocas(cloudTrocas);
-        }
-
-        // 6. Faltas
-        if (cloudFaltas && cloudFaltas.length > 0) {
-          setFaltasMapeadas(cloudFaltas);
-        }
-
-        // 7. Fechamentos Congelados
-        if (cloudFrozen && cloudFrozen.length > 0) {
-          setFrozenReconciliations(cloudFrozen);
-        }
-
-        // 8. Usuários
-        if (cloudUsers && cloudUsers.length > 0) {
-          setUsers(prev => {
-            const merged = [...prev];
-            cloudUsers.forEach(cu => {
-              if (!merged.some(m => m.id === cu.id || m.matricula === cu.matricula)) {
-                merged.push(cu);
-              }
-            });
-            return merged;
-          });
-        }
-
-        // 9. Produtos
-        if (cloudProducts && cloudProducts.length > 0) {
-          setProductsMap(prev => {
-            const nextMap = new Map(prev);
-            cloudProducts.forEach(cp => {
-              const code = cp?.codigo || (cp as any)?.sku;
-              if (code) {
-                const existing = nextMap.get(code);
-                nextMap.set(code, { ...existing, ...cp, codigo: code });
-              }
-            });
-            return nextMap;
-          });
-        }
-
-        // 10. Status de Faturamento Semanal
-        if (cloudBilling && Object.keys(cloudBilling).length > 0) {
-          setWeeklyBillingStatus(prev => ({ ...prev, ...cloudBilling }));
-        }
-      } catch (err) {
-        console.warn('[Firebase] Automatic cloud sync notice:', err);
-      }
-    }
-
-    executeCloudSync();
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
   const handleConfirmSaveAndReset = (savedInfo: { filename: string; frozenRecord: FrozenReconciliation; method: string }) => {
-    // 1. Salva a conciliação no histórico de congeladas
-    setFrozenReconciliations(prev => [savedInfo.frozenRecord, ...prev]);
-
-    // Salva cópia na nuvem Firestore
-    saveFrozenReconciliationToFirestore(savedInfo.frozenRecord).catch(e => {
-      console.warn('[Firebase] Erro ao salvar reconciliação na nuvem:', e);
+    // 1. Salva a conciliação no histórico de congeladas (com sincronização imediata Local + Nuvem + GitHub)
+    updateFrozenReconciliations((prev) => [savedInfo.frozenRecord, ...prev]);
+    saveFrozenReconciliationToFirestore(savedInfo.frozenRecord).catch((e) => {
+      console.warn('[Firebase] Aviso ao salvar reconciliação individual:', e);
     });
 
-    // 2. Preserva as posições 02.05.02 do estoque sem zerar a base (evita perda de dados durante modificações)
-    // A base só é limpa se o usuário clicar explicitamente em "Zerar Bases" no menu do sistema
-
-    // 3. Fecha modal e avisa o usuário
+    // 2. Preserva as posições 02.05.02 do estoque sem zerar a base
     setIsSaveModalOpen(false);
     setToastMessage({
       type: 'success',
-      text: `Conciliação "${savedInfo.frozenRecord.nome}" salva com sucesso! A diferença foi congelada na Diferença Diária e na Diferença Congelada/Mensal. A base 02.05.02 foi preservada.`
+      text: `Conciliação "${savedInfo.frozenRecord.nome}" salva e sincronizada! A diferença foi congelada na Diferença Diária e na Diferença Mensal. A base 02.05.02 foi preservada.`,
     });
 
-    // 4. Navega para a guia de Diferença Diária para conferência imediata
+    // 3. Navega para a guia de Diferença Diária para conferência imediata
     setCurrentTab('dif_diaria');
   };
 
-  // Reset to initial clean state (Zerar Base)
+  // Open confirmation modal to reset data (Zerar Base) without window.confirm/alert
   const handleResetData = () => {
-    if (confirm('Deseja limpar todos os dados manuais da plataforma? Todas as posições de estoque, quebras, vales, trocas e faltas serão zeradas para que você possa importar sua própria base do zero.')) {
-      isExplicitResetRef.current = true;
-      setStockPositions([]);
-      setQuebras([]);
-      setVales([]);
-      setTrocas([]);
-      setFaltasMapeadas([]);
-      setIsRecountApplied(false);
-      localStorage.removeItem('gestao_estoque_v3_posicoes');
-      localStorage.removeItem('gestao_estoque_v3_quebras');
-      localStorage.removeItem('gestao_estoque_v3_vales');
-      localStorage.removeItem('gestao_estoque_v5_trocas_doc');
-      localStorage.removeItem('gestao_estoque_v4_trocas');
-      localStorage.removeItem('gestao_estoque_v3_trocas');
-      localStorage.removeItem('gestao_estoque_v3_faltas');
-      removePersistedData(STORAGE_KEYS.STOCK_POSITIONS_020502);
-      removePersistedData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY);
-      removePersistedData(STORAGE_KEYS.GRADE_POSITIONS);
-      removePersistedData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY);
-      removePersistedData(STORAGE_KEYS.QUEBRAS);
-      removePersistedData(STORAGE_KEYS.VALES);
-      removePersistedData(STORAGE_KEYS.TROCAS);
-      removePersistedData(STORAGE_KEYS.FALTAS);
-      alert('Plataforma zerada com sucesso! Base limpa para novas importações manuais.');
-    }
+    setIsResetConfirmModalOpen(true);
+  };
+
+  const executeConfirmedResetData = () => {
+    isExplicitResetRef.current = true;
+    setIsRecountApplied(false);
+
+    localStorage.removeItem('gestao_estoque_v3_posicoes');
+    localStorage.removeItem('gestao_estoque_v3_quebras');
+    localStorage.removeItem('gestao_estoque_v3_vales');
+    localStorage.removeItem('gestao_estoque_v5_trocas_doc');
+    localStorage.removeItem('gestao_estoque_v4_trocas');
+    localStorage.removeItem('gestao_estoque_v3_trocas');
+    localStorage.removeItem('gestao_estoque_v3_faltas');
+
+    removePersistedData(STORAGE_KEYS.STOCK_POSITIONS_020502);
+    removePersistedData(STORAGE_KEYS.STOCK_POSITIONS_LEGACY);
+    removePersistedData(STORAGE_KEYS.GRADE_POSITIONS);
+    removePersistedData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY);
+    removePersistedData(STORAGE_KEYS.QUEBRAS);
+    removePersistedData(STORAGE_KEYS.VALES);
+    removePersistedData(STORAGE_KEYS.TROCAS);
+    removePersistedData(STORAGE_KEYS.FALTAS);
+
+    updateStockPositions([]);
+    updateGradeStockPositions([]);
+    updateQuebras([]);
+    updateVales([]);
+    updateTrocas([]);
+    updateFaltasMapeadas([]);
+
+    setIsResetConfirmModalOpen(false);
+    setToastMessage({
+      type: 'info',
+      text: 'Plataforma zerada e sincronizada com sucesso! Base limpa para novas importações manuais.',
+    });
   };
 
   // Open import modal strictly locked to the requested file type and mode
@@ -918,35 +1440,35 @@ export default function App() {
   };
 
   const handleSaveManualQuebra = (novaQuebra: QuebraItem) => {
-    setQuebras(prev => [novaQuebra, ...prev]);
+    updateQuebras((prev) => [novaQuebra, ...prev]);
     setToastMessage({
       type: 'success',
-      text: `Quebra (${novaQuebra.quantidade} cx de SKU ${novaQuebra.sku}) lançada com sucesso no depósito ${novaQuebra.deposito}.`
+      text: `Quebra (${novaQuebra.quantidade} cx de SKU ${novaQuebra.sku}) lançada e sincronizada com sucesso no depósito ${novaQuebra.deposito}.`,
     });
   };
 
   const handleSaveManualVale = (novoVale: ValeItem) => {
-    setVales(prev => [novoVale, ...prev]);
+    updateVales((prev) => [novoVale, ...prev]);
     setToastMessage({
       type: 'success',
-      text: `Vale (${novoVale.quantidade} cx de SKU ${novoVale.codigo}) lançado com sucesso no depósito ${novoVale.deposito}.`
+      text: `Vale (${novoVale.quantidade} cx de SKU ${novoVale.codigo}) lançado e sincronizado com sucesso no depósito ${novoVale.deposito}.`,
     });
   };
 
   const handleSaveManualTroca = (novaTroca: TrocaItem) => {
-    setTrocas(prev => [novaTroca, ...prev]);
+    updateTrocas((prev) => [novaTroca, ...prev]);
     setToastMessage({
       type: 'success',
-      text: `Troca (${novaTroca.quantidade} cx de SKU ${novaTroca.sku}) lançada com sucesso no depósito ${novaTroca.deposito}.`
+      text: `Troca (${novaTroca.quantidade} cx de SKU ${novaTroca.sku}) lançada e sincronizada com sucesso no depósito ${novaTroca.deposito}.`,
     });
   };
 
   // Handler for adding a new manual falta
   const handleSaveManualFalta = (novaFalta: FaltaMapeadaItem) => {
-    setFaltasMapeadas(prev => [novaFalta, ...prev]);
+    updateFaltasMapeadas((prev) => [novaFalta, ...prev]);
     setToastMessage({
       type: 'success',
-      text: `Falta de doca (${novaFalta.quantidade} cx de SKU ${novaFalta.codigo || novaFalta.produto}) lançada com sucesso.`
+      text: `Falta de doca (${novaFalta.quantidade} cx de SKU ${novaFalta.codigo || novaFalta.produto}) lançada e sincronizada com sucesso.`,
     });
   };
 
@@ -966,18 +1488,22 @@ export default function App() {
         faltasMapeadas,
         selectedDeposito,
         filename,
-        weeklyBillingStatus
+        weeklyBillingStatus,
+        productsMap,
       });
 
       if (result.success) {
         setToastMessage({
           type: 'success',
-          text: `Relatório Excel exportado com sucesso! Arquivo: ${result.filename}`
+          text: `Relatório Excel exportado com sucesso! Arquivo: ${result.filename}`,
         });
       }
     } catch (err) {
       console.error('Erro ao exportar conciliação em Excel:', err);
-      alert('Ocorreu um erro ao gerar a planilha Excel da conciliação.');
+      setToastMessage({
+        type: 'error',
+        text: 'Ocorreu um erro ao gerar a planilha Excel da conciliação.',
+      });
     }
   };
 
@@ -1031,6 +1557,9 @@ export default function App() {
           currentUser={currentUser}
           onNavigateLogin={() => setCurrentTab('login')}
           onLogout={handleLogout}
+          cloudSyncStatus={cloudSyncStatus}
+          lastCloudSyncLabel={lastCloudSyncLabel}
+          onForceCloudSync={handleForceCloudSync}
         />
 
         {/* Quota Exceeded Informative Banner */}
@@ -1039,12 +1568,19 @@ export default function App() {
             <div className="flex items-center gap-2">
               <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-500/20 text-amber-700 font-bold shrink-0">!</span>
               <span>
-                <strong>Aviso de Cota do Firestore:</strong> A cota diária gratuita do Cloud Firestore foi atingida (Quota exceeded). A plataforma continua funcionando normalmente com <strong>armazenamento local persistente (LocalStorage / IndexedDB)</strong>, mantendo 100% de seus dados e conciliações preservados. A cota é reiniciada automaticamente no próximo ciclo diário do Firebase.
+                <strong>Aviso de Cota do Firestore:</strong> A cota diária gratuita do Cloud Firestore foi atingida. A plataforma continua funcionando normalmente com <strong>armazenamento local persistente (LocalStorage / IndexedDB)</strong>, mantendo 100% de seus dados preservados.
               </span>
             </div>
             <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleForceCloudSync}
+                className="px-2.5 py-1 bg-white border border-amber-400 hover:bg-amber-50 text-amber-900 font-semibold rounded transition-colors text-xs cursor-pointer"
+              >
+                Tentar Reconectar
+              </button>
               <a
-                href="https://console.firebase.google.com/project/armazem-facil--oficial/firestore/databases/(default)/data?openUpgradeDialog=true"
+                href="https://console.firebase.google.com/project/scenic-year-l5xj8/firestore/databases/ai-studio-conciliaodeestoq-3b77108f-dfc6-4120-9722-24391951064c/data?openUpgradeDialog=true"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white font-medium rounded transition-colors text-xs inline-flex items-center gap-1"
@@ -1073,18 +1609,26 @@ export default function App() {
                 trocas={trocas}
                 faltasMapeadas={faltasMapeadas}
                 selectedDeposito={selectedDeposito}
-                onNavigateTab={setCurrentTab}
+                onNavigateTab={(tab) => {
+                  if (tab === 'conciliacao_ajustes') {
+                    setReconciliationMode('com_ajuste');
+                  }
+                  setCurrentTab(tab);
+                }}
                 onOpenManualFaltaModal={() => setIsManualFaltaModalOpen(true)}
                 onOpenManualModal={handleOpenManualCongelamentoModal}
                 weeklyBillingStatus={weeklyBillingStatus}
                 frozenReconciliations={frozenReconciliations}
+                productsMap={productsMap}
+                reconciliationMode={reconciliationMode}
+                onChangeReconciliationMode={setReconciliationMode}
               />
             )}
 
             {(currentTab === 'conciliacao' || currentTab === 'conciliacao_ajustes') && (
               <ConciliacaoView
                 stockPositions={stockPositions}
-                setStockPositions={setStockPositions}
+                setStockPositions={updateStockPositions}
                 selectedDeposito={selectedDeposito}
                 setSelectedDeposito={setSelectedDeposito}
                 onOpenImportModal={(initial) => handleOpenImportModal(initial || '020502')}
@@ -1094,9 +1638,12 @@ export default function App() {
                 vales={vales}
                 trocas={trocas}
                 faltasMapeadas={faltasMapeadas}
-                initialSubTab={currentTab === 'conciliacao_ajustes' ? 'ajustes' : 'padrao'}
+                initialSubTab={currentTab === 'conciliacao_ajustes' ? 'ajustes' : (reconciliationMode === 'com_ajuste' ? 'ajustes' : 'padrao')}
+                reconciliationMode={currentTab === 'conciliacao_ajustes' ? 'com_ajuste' : reconciliationMode}
+                onChangeReconciliationMode={setReconciliationMode}
                 onNavigateTab={(tab) => {
                   if (tab === 'conciliacao_ajustes') {
+                    setReconciliationMode('com_ajuste');
                     setCurrentTab('conciliacao');
                   } else {
                     setCurrentTab(tab);
@@ -1111,9 +1658,9 @@ export default function App() {
             {currentTab === 'grade_estoque' && (
               <GradeEstoqueView
                 stockPositions={gradeStockPositions}
-                setStockPositions={setGradeStockPositions}
+                setStockPositions={updateGradeStockPositions}
                 generalStockPositions={stockPositions}
-                setGeneralStockPositions={setStockPositions}
+                setGeneralStockPositions={updateStockPositions}
                 productsMap={productsMap}
                 quebras={quebras}
                 vales={vales}
@@ -1129,12 +1676,19 @@ export default function App() {
             {(currentTab === 'dif_diaria' || currentTab === 'congeladas') && (
               <DifDiariaView
                 stockPositions={stockPositions}
+                quebras={quebras}
+                vales={vales}
+                trocas={trocas}
+                faltasMapeadas={faltasMapeadas}
                 selectedDeposito={selectedDeposito}
                 setSelectedDeposito={setSelectedDeposito}
                 productsMap={productsMap}
                 frozenReconciliations={frozenReconciliations}
                 onOpenSaveModal={() => setIsSaveModalOpen(true)}
                 onNavigateTab={setCurrentTab}
+                weeklyBillingStatus={weeklyBillingStatus}
+                reconciliationMode={reconciliationMode}
+                onChangeReconciliationMode={setReconciliationMode}
               />
             )}
 
@@ -1161,9 +1715,9 @@ export default function App() {
                   setSelectedDeposito={setSelectedDeposito}
                   currentUser={currentUser}
                   productsMap={productsMap}
-                  onUpdateProductsMap={setProductsMap}
-                  onUpdateStockPositions={setStockPositions}
-                  onUpdateGradeStockPositions={setGradeStockPositions}
+                  onUpdateProductsMap={updateProductsMap}
+                  onUpdateStockPositions={updateStockPositions}
+                  onUpdateGradeStockPositions={updateGradeStockPositions}
                   onOpenImportModal={handleOpenImportModal}
                 />
               </InversaoErrorBoundary>
@@ -1175,9 +1729,9 @@ export default function App() {
                 selectedDeposito={selectedDeposito}
                 onOpenImportModal={() => handleOpenImportModal('quebras')}
                 onOpenManualQuebra={() => handleOpenManualCongelamentoModal('quebra')}
-                onUpdateQuebras={setQuebras}
+                onUpdateQuebras={updateQuebras}
                 weeklyBillingStatus={weeklyBillingStatus}
-                onUpdateWeeklyBillingStatus={setWeeklyBillingStatus}
+                onUpdateWeeklyBillingStatus={updateWeeklyBillingStatus}
               />
             )}
 
@@ -1187,7 +1741,7 @@ export default function App() {
                 selectedDeposito={selectedDeposito}
                 onOpenImportModal={() => handleOpenImportModal('vales')}
                 onOpenManualVale={() => handleOpenManualCongelamentoModal('vale')}
-                onUpdateVales={setVales}
+                onUpdateVales={updateVales}
                 weeklyBillingStatus={weeklyBillingStatus}
               />
             )}
@@ -1198,7 +1752,7 @@ export default function App() {
                 selectedDeposito={selectedDeposito}
                 onOpenImportModal={() => handleOpenImportModal('trocas')}
                 onOpenManualTroca={() => handleOpenManualCongelamentoModal('troca')}
-                onUpdateTrocas={setTrocas}
+                onUpdateTrocas={updateTrocas}
                 weeklyBillingStatus={weeklyBillingStatus}
               />
             )}
@@ -1206,7 +1760,7 @@ export default function App() {
             {currentTab === 'faltas' && (
               <FaltasView
                 faltasMapeadas={faltasMapeadas}
-                setFaltasMapeadas={setFaltasMapeadas}
+                setFaltasMapeadas={updateFaltasMapeadas}
                 selectedDeposito={selectedDeposito}
                 onOpenManualFaltaModal={() => handleOpenManualCongelamentoModal('falta')}
                 onOpenImportModal={() => handleOpenImportModal('faltas')}
@@ -1218,9 +1772,9 @@ export default function App() {
             {currentTab === 'produtos' && (
               <ProdutosView
                 productsMap={productsMap}
-                setProductsMap={setProductsMap}
+                setProductsMap={updateProductsMap}
                 stockPositions={stockPositions}
-                setStockPositions={setStockPositions}
+                setStockPositions={updateStockPositions}
                 onOpenImportModal={() => handleOpenImportModal('cadastro')}
                 onExportReport={handleExportConsolidatedReport}
                 onClearAllData={handleResetData}
@@ -1230,7 +1784,7 @@ export default function App() {
             {currentTab === 'login' && (
               <LoginView
                 users={users}
-                setUsers={setUsers}
+                setUsers={updateUsers}
                 currentUser={currentUser}
                 setCurrentUser={setCurrentUser}
                 onNavigateTab={setCurrentTab}
@@ -1273,15 +1827,15 @@ export default function App() {
         lockedFileType={importLockedType}
         selectedDeposito={selectedDeposito}
         productsMap={productsMap}
-        setProductsMap={setProductsMap}
+        setProductsMap={updateProductsMap}
         stockPositions={stockPositions}
-        setStockPositions={setStockPositions}
+        setStockPositions={updateStockPositions}
         gradeStockPositions={gradeStockPositions}
-        setGradeStockPositions={setGradeStockPositions}
-        setQuebras={setQuebras}
-        setVales={setVales}
-        setTrocas={setTrocas}
-        setFaltasMapeadas={setFaltasMapeadas}
+        setGradeStockPositions={updateGradeStockPositions}
+        setQuebras={updateQuebras}
+        setVales={updateVales}
+        setTrocas={updateTrocas}
+        setFaltasMapeadas={updateFaltasMapeadas}
         setIsRecountApplied={setIsRecountApplied}
       />
 
@@ -1301,17 +1855,50 @@ export default function App() {
         weeklyBillingStatus={weeklyBillingStatus}
       />
 
+      {/* Inline Reset Platform Confirmation Modal (No window.confirm/alert) */}
+      {isResetConfirmModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-md w-full p-5 space-y-4">
+            <div>
+              <h3 className="text-base font-bold text-slate-900">
+                Zerar Bases Operacionais da Plataforma?
+              </h3>
+              <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
+                Todas as posições de estoque (02.05.02 e Grade), quebras, vales, trocas e faltas serão limpas localmente e sincronizadas na nuvem para que você possa importar uma nova base do zero.
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setIsResetConfirmModalOpen(false)}
+                className="px-3.5 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-semibold transition cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={executeConfirmedResetData}
+                className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition cursor-pointer"
+              >
+                Confirmar Limpeza
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Notification Toast */}
       {toastMessage && (
         <div className="fixed bottom-5 right-5 z-50 max-w-md bg-slate-900 text-white p-4 rounded-xl shadow-2xl border border-slate-700 flex items-start gap-3 animate-in fade-in slide-in-from-bottom-3">
-          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 mt-1.5 flex-shrink-0 animate-pulse" />
           <div className="flex-1 text-xs">
-            <div className="font-bold text-slate-200">Notificação do Sistema</div>
+            <div className="font-bold text-slate-200">
+              {toastMessage.type === 'error' ? 'Atenção' : 'Sincronização & Sistema'}
+            </div>
             <p className="text-slate-300 mt-0.5 leading-relaxed">{toastMessage.text}</p>
           </div>
           <button
             onClick={() => setToastMessage(null)}
-            className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
+            className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800 cursor-pointer"
           >
             ✕
           </button>

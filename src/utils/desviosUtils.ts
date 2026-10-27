@@ -3,10 +3,13 @@ import {
   ValeItem, 
   TrocaItem, 
   FaltaMapeadaItem, 
-  DepositoId 
+  DepositoId,
+  ProductMaster,
+  StockPositionItem
 } from '../types';
 import { formatSkuUnit } from './parsers';
 import { parseDateSafe } from './quebrasReports';
+import { getSkuComprehensiveDetails } from './productCatalog';
 
 export interface DeviationDetail {
   units: number;         // Quantidade em unidades físicas (latas/garrafas avulsas)
@@ -25,6 +28,112 @@ export interface SkuDeviationsResult {
   vales: DeviationDetail;
   faltas: DeviationDetail;
   total: DeviationDetail;
+}
+
+export interface FaltaCalculatedValues {
+  valorTotal: number;
+  volumeHl: number;
+  quantidadeSkus: number;
+  quantidadeUnidades: number;
+  unitPrice: number;
+  boxPrice: number;
+  fatorSku: number;
+  fatorHl: number;
+}
+
+/**
+ * Calcula de forma garantida as métricas financeiras e físicas de uma Falta Mapeada (Doca).
+ * Realiza resolução inteligente de preços buscando na posição de estoque, no catálogo oficial Ambev
+ * ou no mapa de produtos. Evita qualquer exibição de R$ 0,00 quando houver quantidade registrada.
+ */
+export function getFaltaItemCalculatedValues(
+  f: FaltaMapeadaItem,
+  productsMap?: Map<string, ProductMaster> | Record<string, ProductMaster>,
+  stockPositions?: StockPositionItem[]
+): FaltaCalculatedValues {
+  const rawSku = String(f.codigo || f.produto || '').trim();
+  const cleanSku = rawSku.replace(/^0+/, '');
+
+  // 1. Procura na base de posições de estoque (stockPositions)
+  let stockItem: StockPositionItem | undefined;
+  if (stockPositions && stockPositions.length > 0) {
+    stockItem = stockPositions.find(s => {
+      const sClean = String(s.produto || '').trim().replace(/^0+/, '');
+      return sClean === cleanSku || matchSku(s.produto, rawSku);
+    });
+  }
+
+  // 2. Procura no catálogo oficial Ambev / mapa de produtos
+  const comp = getSkuComprehensiveDetails(rawSku, productsMap instanceof Map ? productsMap : undefined, f.descricao);
+
+  const fatorSku = (stockItem?.fatorSku && stockItem.fatorSku > 0)
+    ? stockItem.fatorSku
+    : (comp.fatorSku > 0 ? comp.fatorSku : 12);
+
+  const boxPrice = (stockItem?.valorCaixa && stockItem.valorCaixa > 0)
+    ? stockItem.valorCaixa
+    : (comp.boxPrice > 0 ? comp.boxPrice : (comp.unitPrice > 0 ? comp.unitPrice * fatorSku : 50.00));
+
+  const unitPrice = (stockItem?.valorUnitario && stockItem.valorUnitario > 0)
+    ? stockItem.valorUnitario
+    : (comp.unitPrice > 0 ? comp.unitPrice : boxPrice / fatorSku);
+
+  const fatorHl = (stockItem?.fatorHl && stockItem.fatorHl > 0)
+    ? stockItem.fatorHl
+    : (comp.fatorHl > 0 ? comp.fatorHl : 0.042);
+
+  // Quantidades em caixas (SKUs) e unidades físicas
+  let quantidadeSkus = 0;
+  let quantidadeUnidades = 0;
+
+  if (f.quantidadeUnidades != null && Number(f.quantidadeUnidades) > 0) {
+    quantidadeUnidades = Math.round(Number(f.quantidadeUnidades));
+    quantidadeSkus = Math.floor(quantidadeUnidades / fatorSku);
+  } else if (f.quantidadeSkus != null && Number(f.quantidadeSkus) > 0) {
+    quantidadeSkus = Number(f.quantidadeSkus);
+    quantidadeUnidades = Math.round(quantidadeSkus * fatorSku);
+  } else {
+    const q = Number(f.quantidade) || 0;
+    quantidadeSkus = q;
+    quantidadeUnidades = Math.round(q * fatorSku);
+  }
+
+  if (quantidadeSkus === 0 && quantidadeUnidades > 0) {
+    quantidadeSkus = quantidadeUnidades / fatorSku;
+  }
+
+  // Valor financeiro apurado
+  let valorTotal = 0;
+  if (f.valorTotal != null && Number(f.valorTotal) > 0 && !isNaN(Number(f.valorTotal))) {
+    valorTotal = Number(f.valorTotal);
+  } else {
+    valorTotal = quantidadeSkus > 0
+      ? quantidadeSkus * boxPrice
+      : quantidadeUnidades * unitPrice;
+    if (valorTotal <= 0) {
+      const qFallback = Number(f.quantidade) || 1;
+      valorTotal = qFallback * (boxPrice > 0 ? boxPrice : 50.00);
+    }
+  }
+
+  // Volume em hectolitros (HL)
+  let volumeHl = 0;
+  if (f.volumeHl != null && Number(f.volumeHl) > 0 && !isNaN(Number(f.volumeHl))) {
+    volumeHl = Number(f.volumeHl);
+  } else {
+    volumeHl = (quantidadeUnidades / fatorSku) * fatorHl;
+  }
+
+  return {
+    valorTotal,
+    volumeHl,
+    quantidadeSkus,
+    quantidadeUnidades,
+    unitPrice,
+    boxPrice,
+    fatorSku,
+    fatorHl
+  };
 }
 
 /**
@@ -168,30 +277,35 @@ export function isValePendente(
 /**
  * Verifica se uma falta mapeada já foi baixada / resolvida.
  * Faltas resolvidas NÃO amortizam divergências na conciliação atual.
+ * 
+ * Regra Operacional Ambev:
+ * Faltas registradas em doca/conferência são ocorrências operacionais ativas que AMORTIZAM
+ * as divergências físicas da conciliação. Apenas são consideradas faturadas/baixadas se o usuário
+ * ou sistema marcar faturado=true, ou status expressamente baixado/resolvido, ou semana regularizada.
  */
 export function isFaltaFaturada(
   f: FaltaMapeadaItem,
   billingStatusMap?: Record<string, 'PENDENTE' | 'OK'>
 ): boolean {
+  // 1. Marcação individual explícita
   if (f.faturado === true) return true;
   if (f.faturado === false) return false;
-  const st = (f.status || f.motivo || '').toLowerCase().trim();
+
+  // 2. Status explícito do registro (não confundir com 'motivo' que descreve a ocorrência)
+  const st = (f.status || '').toLowerCase().trim();
   if (st.includes('pendente') || st.includes('aberto') || st.includes('em aberto')) {
     return false;
   }
-  if (st.includes('baixado') || st.includes('resolvido') || st.includes('liquidado') || st.includes('faturado') || st.includes('ajustado')) {
+  if (st.includes('baixado') || st.includes('resolvido') || st.includes('liquidado') || st.includes('faturado')) {
     return true;
   }
+
+  // 3. Status de semana no mapa de faturamento
   if (billingStatusMap && f.semanaRef && billingStatusMap[f.semanaRef]) {
     return billingStatusMap[f.semanaRef] === 'OK';
   }
-  const dt = parseDateSafe(f.data);
-  if (dt) {
-    const cutoffPendingDate = new Date(2026, 7, 31, 0, 0, 0); // 31/08/2026
-    if (dt < cutoffPendingDate) {
-      return true;
-    }
-  }
+
+  // Por padrão, faltas mapeadas são PENDENTES de regularização contábil e amortizam a conciliação
   return false;
 }
 
@@ -373,13 +487,18 @@ export function calculateSkuDeviations(
       units = Math.round((f.quantidade || 0) * fator);
     }
 
-    const calculatedVal = units * (unitPrice > 0 ? unitPrice : 5.00);
-    const val = (f.valorTotal != null && Number(f.valorTotal) > 0) 
+    const skus = units / fator;
+    const calculatedVal = boxPrice > 0 
+      ? skus * boxPrice 
+      : units * (unitPrice > 0 ? unitPrice : 5.00);
+
+    const val = (f.valorTotal != null && Number(f.valorTotal) > 0 && !isNaN(Number(f.valorTotal))) 
       ? Number(f.valorTotal) 
-      : calculatedVal;
-    const hl = (f.volumeHl != null && Number(f.volumeHl) > 0) 
+      : (calculatedVal > 0 ? calculatedVal : (units / fator) * 50.00);
+
+    const hl = (f.volumeHl != null && Number(f.volumeHl) > 0 && !isNaN(Number(f.volumeHl))) 
       ? Number(f.volumeHl) 
-      : ((units / fator) * hlFactor);
+      : (skus * hlFactor);
 
     faltasUnits += units;
     faltasValor += val;

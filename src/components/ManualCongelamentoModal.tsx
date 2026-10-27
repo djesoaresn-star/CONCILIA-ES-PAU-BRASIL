@@ -27,6 +27,7 @@ import {
   FaltaMapeadaItem 
 } from '../types';
 import { formatCurrency, formatHectoliters } from '../utils/parsers';
+import { getWeekRangeInfo, parseDateSafe } from '../utils/quebrasReports';
 import { DEPOSITOS } from '../data/initialData';
 
 export type CongelamentoType = 'quebra' | 'vale' | 'troca' | 'falta';
@@ -175,7 +176,7 @@ export const ManualCongelamentoModal: React.FC<ManualCongelamentoModalProps> = (
         deposito: deposito,
         faturado: isFaturada,
         dataFaturamento: isFaturada ? formattedDate : undefined,
-        semanaRef: 'MANUAL',
+        semanaRef: getWeekRangeInfo(parseDateSafe(formattedDate) || new Date()).label,
       };
       onSaveQuebra(novaQuebra);
       setNotificationMsg(`Quebra de ${quantidade} cx (${selectedProduct.descricao}) inserida com sucesso!`);

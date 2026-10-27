@@ -7,10 +7,12 @@ import {
   ValeItem, 
   TrocaItem, 
   FaltaMapeadaItem, 
-  DepositoId 
+  DepositoId,
+  ProductMaster
 } from '../types';
 import { formatCurrency, formatHectoliters, formatSkuUnit } from './parsers';
-import { calculateSkuDeviations, isQuebraFaturada } from './desviosUtils';
+import { isQuebraFaturada, getFaltaItemCalculatedValues } from './desviosUtils';
+import { reconcileAllStock } from './reconciliationEngine';
 
 export interface ExportReconciliationData {
   stockPositions: StockPositionItem[];
@@ -33,6 +35,7 @@ export interface ExportReconciliationData {
 
 /**
  * Calcula os itens da conciliação ajustada equalizada com todos os desvios
+ * utilizando o motor único canônico de conciliação (reconcileAllStock).
  */
 export function computeAdjustedItems(
   stockPositions: StockPositionItem[],
@@ -40,131 +43,20 @@ export function computeAdjustedItems(
   vales: ValeItem[] = [],
   trocas: TrocaItem[] = [],
   faltasMapeadas: FaltaMapeadaItem[] = [],
-  weeklyBillingStatus?: Record<string, 'PENDENTE' | 'OK'>
+  weeklyBillingStatus?: Record<string, 'PENDENTE' | 'OK'>,
+  selectedDeposito: DepositoId | 'ALL' = 'ALL',
+  productsMap?: Map<string, ProductMaster>
 ): ItemConciliacaoAjustada[] {
-  return stockPositions.map(stockItem => {
-    const dep = stockItem.deposito;
-    const sku = String(stockItem.produto).trim();
-    const fator = Math.max(1, stockItem.fatorSku || 1);
-
-    const dev = calculateSkuDeviations(
-      sku,
-      dep,
-      fator,
-      stockItem.valorUnitario,
-      stockItem.valorCaixa,
-      stockItem.fatorHl,
-      quebras,
-      vales,
-      trocas,
-      faltasMapeadas,
-      weeklyBillingStatus
-    );
-
-    const totalDesviosUnits = dev.total.units;
-    const totalDesviosSkus = dev.total.skus;
-    const desviosRaw = dev.total.raw;
-    const valorDesvios = dev.total.valor;
-    const hlDesvios = dev.total.volumeHl;
-
-    const fisicoUnits = stockItem.inventarioTotalUnits;
-    const fisicoSkus = Math.floor(fisicoUnits / fator);
-    const valorFisico = fisicoUnits * stockItem.valorUnitario;
-
-    const finalTotalUnits = fisicoUnits + totalDesviosUnits;
-    const finalSkus = Math.floor(finalTotalUnits / fator);
-    const finalRaw = formatSkuUnit(finalTotalUnits, fator);
-    const valorFinal = finalTotalUnits * stockItem.valorUnitario;
-
-    const fiscalUnits = stockItem.disponivelTotalUnits;
-    const fiscalSkus = Math.floor(fiscalUnits / fator);
-    const valorFiscal = fiscalUnits * stockItem.valorUnitario;
-
-    let divergenciaUnits = finalTotalUnits - fiscalUnits;
-    if (stockItem.saldoNegativoDesconsiderado || fiscalUnits < 0) {
-      divergenciaUnits = 0;
-    }
-
-    const wholeSkus = Math.trunc(divergenciaUnits / fator);
-    const divergenciaRaw = formatSkuUnit(divergenciaUnits, fator);
-
-    // REGRA AMBEV: Unidades avulsas após a barra não geram divergência residual
-    let statusAjustado: 'CONCILIADO' | 'FALTA_RESIDUAL' | 'SOBRA_RESIDUAL' = 'CONCILIADO';
-    let divergenciaSkus = 0;
-    let impactoFinanceiroResidual = 0;
-    let impactoHlResidual = 0;
-
-    if (wholeSkus !== 0) {
-      divergenciaSkus = wholeSkus;
-      statusAjustado = wholeSkus > 0 ? 'SOBRA_RESIDUAL' : 'FALTA_RESIDUAL';
-      impactoFinanceiroResidual = wholeSkus * stockItem.valorCaixa;
-      impactoHlResidual = wholeSkus * stockItem.fatorHl;
-    }
-
-    return {
-      deposito: dep,
-      produto: sku,
-      descricao: stockItem.descricao,
-      grupo: stockItem.grupo || 'GERAL',
-      fatorSku: fator,
-      fatorHl: stockItem.fatorHl,
-      valorUnitario: stockItem.valorUnitario,
-      valorCaixa: stockItem.valorCaixa,
-
-      fiscalRaw: stockItem.disponivelRaw,
-      fiscalSkus,
-      fiscalUnits,
-      fiscalTotalUnits: fiscalUnits,
-      valorFiscal,
-
-      desviosRaw,
-      desviosSkus: totalDesviosSkus,
-      desviosUnits: totalDesviosUnits,
-      valorDesvios,
-      hlDesvios,
-      detalheDesvios: {
-        quebrasSkus: dev.quebras.skus,
-        quebrasUnits: dev.quebras.units,
-        quebrasValor: dev.quebras.valor,
-        quebrasRaw: dev.quebras.raw,
-
-        valesSkus: dev.vales.skus,
-        valesUnits: dev.vales.units,
-        valesValor: dev.vales.valor,
-        valesRaw: dev.vales.raw,
-
-        trocasSkus: dev.trocas.skus,
-        trocasUnits: dev.trocas.units,
-        trocasValor: dev.trocas.valor,
-        trocasRaw: dev.trocas.raw,
-
-        faltasSkus: dev.faltas.skus,
-        faltasUnits: dev.faltas.units,
-        faltasValor: dev.faltas.valor,
-        faltasRaw: dev.faltas.raw,
-      },
-
-      fisicoRaw: stockItem.inventarioRaw,
-      fisicoSkus,
-      fisicoUnits,
-      fisicoTotalUnits: fisicoUnits,
-      valorFisico,
-
-      finalRaw,
-      finalSkus,
-      finalUnits: finalTotalUnits,
-      finalTotalUnits,
-      valorFinal,
-
-      divergenciaResidualRaw: divergenciaRaw,
-      divergenciaResidualSkus: divergenciaSkus,
-      divergenciaResidualUnits: divergenciaUnits,
-      statusAjustado,
-      impactoFinanceiroResidual,
-      impactoHlResidual,
-      recontado: stockItem.recontado
-    };
-  });
+  return reconcileAllStock({
+    stockPositions,
+    quebras,
+    vales,
+    trocas,
+    faltasMapeadas,
+    selectedDeposito,
+    weeklyBillingStatus,
+    productsMap,
+  }).adjustedItems;
 }
 
 /**
@@ -490,19 +382,22 @@ export function buildReconciliationWorkbook(data: ExportReconciliationData): XLS
       'Origem'
     ];
 
-    const rowsFaltas = (data.faltasMapeadas || []).map(f => [
-      f.deposito || '01',
-      f.data || '',
-      f.codigo || (f as any).produto,
-      f.descricao,
-      f.quantidade,
-      Number(((f as any).valorTotal || 0).toFixed(2)),
-      Number(((f as any).volumeHl || 0).toFixed(3)),
-      f.motivo || 'FALTA OPERACIONAL',
-      f.observacao,
-      f.responsavel || '',
-      f.origem || 'MANUAL'
-    ]);
+    const rowsFaltas = (data.faltasMapeadas || []).map(f => {
+      const vals = getFaltaItemCalculatedValues(f, undefined, data.stockPositions);
+      return [
+        f.deposito || '01',
+        f.data || '',
+        f.codigo || (f as any).produto,
+        f.descricao,
+        vals.quantidadeSkus || f.quantidade,
+        Number(vals.valorTotal.toFixed(2)),
+        Number(vals.volumeHl.toFixed(3)),
+        f.motivo || 'FALTA OPERACIONAL',
+        f.observacao,
+        f.responsavel || '',
+        f.origem || 'MANUAL'
+      ];
+    });
 
     const wsFaltas = XLSX.utils.aoa_to_sheet([headersFaltas, ...rowsFaltas]);
     wsFaltas['!cols'] = [
@@ -592,6 +487,7 @@ export async function exportConciliacaoExcel(params: {
   selectedDeposito?: DepositoId | 'ALL';
   filename?: string;
   weeklyBillingStatus?: Record<string, 'PENDENTE' | 'OK'>;
+  productsMap?: Map<string, ProductMaster>;
 }): Promise<{ success: boolean; method: 'picker' | 'download'; filename: string }> {
   const selectedDeposito = params.selectedDeposito || 'ALL';
   const quebras = params.quebras || [];
@@ -599,18 +495,26 @@ export async function exportConciliacaoExcel(params: {
   const trocas = params.trocas || [];
   const faltasMapeadas = params.faltasMapeadas || [];
 
-  const adjustedItems = params.adjustedItems || computeAdjustedItems(
-    params.stockPositions,
+  const reconciled = reconcileAllStock({
+    stockPositions: params.stockPositions,
     quebras,
     vales,
     trocas,
     faltasMapeadas,
-    params.weeklyBillingStatus
-  );
+    selectedDeposito,
+    weeklyBillingStatus: params.weeklyBillingStatus,
+    productsMap: params.productsMap,
+  });
+
+  const adjustedItems = params.adjustedItems || reconciled.adjustedItems;
 
   const wb = buildReconciliationWorkbook({
-    stockPositions: params.stockPositions,
+    stockPositions: reconciled.healedStock,
     adjustedItems,
+    rankingSobrasSemAjustes: reconciled.excelRankingSobrasSemAjustes,
+    rankingFaltasSemAjustes: reconciled.excelRankingFaltasSemAjustes,
+    rankingSobrasComAjustes: reconciled.excelRankingSobrasComAjustes,
+    rankingFaltasComAjustes: reconciled.excelRankingFaltasComAjustes,
     selectedDeposito,
     includeAuditTabs: false,
     quebras,

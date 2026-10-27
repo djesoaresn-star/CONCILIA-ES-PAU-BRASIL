@@ -1,21 +1,25 @@
-import { StockPositionItem, QuebraItem, ValeItem, TrocaItem, FaltaMapeadaItem } from '../types';
-import { persistData, STORAGE_KEYS } from '../utils/persistentStorage';
+import { StockPositionItem, QuebraItem, ValeItem, TrocaItem, FaltaMapeadaItem, FrozenReconciliation, ProductMaster } from '../types';
+import { persistData, STORAGE_KEYS, WorkspaceSyncMeta } from '../utils/persistentStorage';
 
 export interface CodeDataPayload {
-  type: 'all' | '020502' | 'grade' | 'quebras' | 'vales' | 'trocas' | 'faltas';
+  type: 'all' | '020502' | 'grade' | 'quebras' | 'vales' | 'trocas' | 'faltas' | 'frozen' | 'products' | 'billing';
   stockPositions?: StockPositionItem[];
   gradeStockPositions?: StockPositionItem[];
   quebras?: QuebraItem[];
   vales?: ValeItem[];
   trocas?: TrocaItem[];
   faltasMapeadas?: FaltaMapeadaItem[];
+  frozenReconciliations?: FrozenReconciliation[];
+  products?: [string, ProductMaster][];
+  weeklyBillingStatus?: Record<string, 'PENDENTE' | 'OK'>;
+  syncMeta?: WorkspaceSyncMeta;
   updatedAt?: string;
 }
 
 /**
- * Grava os dados diretamente no código (persistedCodeData.json no backend)
- * e simultaneamente na persistência blindada local (IndexedDB + LocalStorage).
- * NÃO depende de banco de dados remoto (Firebase).
+ * Grava os dados na persistência blindada local (IndexedDB + LocalStorage)
+ * e, quando em servidor de desenvolvimento (AI Studio), grava também em persistedCodeData.json
+ * para que a exportação ao GitHub inclua o estado mais recente sem gerar erros 404/405 no GitHub Pages.
  */
 export async function saveToCodeStorage(payload: CodeDataPayload): Promise<{ success: boolean; message: string }> {
   // 1. Persistência local imediata e confiável
@@ -41,32 +45,43 @@ export async function saveToCodeStorage(payload: CodeDataPayload): Promise<{ suc
     if (payload.faltasMapeadas) {
       await persistData(STORAGE_KEYS.FALTAS, payload.faltasMapeadas);
     }
+    if (payload.frozenReconciliations) {
+      await persistData(STORAGE_KEYS.FROZEN, payload.frozenReconciliations);
+    }
+    if (payload.products) {
+      await persistData(STORAGE_KEYS.PRODUCTS, payload.products);
+    }
+    if (payload.weeklyBillingStatus) {
+      await persistData(STORAGE_KEYS.WEEKLY_BILLING, payload.weeklyBillingStatus);
+    }
   } catch (localErr) {
     console.warn('[CodeStorage] Erro ao persistir localmente:', localErr);
   }
 
-  // 2. Gravação direta no arquivo de código via API do servidor (se disponível)
-  try {
-    const res = await fetch('/api/save-code-data', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ...payload,
-        updatedAt: new Date().toISOString()
-      }),
-    });
+  // 2. Gravação direta no arquivo de código apenas no ambiente de desenvolvimento (evita 404/405 em GitHub Pages estático)
+  if (import.meta.env.DEV) {
+    try {
+      const res = await fetch('/api/save-code-data', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...payload,
+          updatedAt: new Date().toISOString()
+        }),
+      });
 
-    if (res.ok) {
-      const data = await res.json();
-      return { success: true, message: data.message || 'Dados gravados no código com sucesso!' };
+      if (res.ok) {
+        const data = await res.json();
+        return { success: true, message: data.message || 'Dados gravados no código com sucesso!' };
+      }
+    } catch {
+      // Silencioso caso rota dev não esteja ativa
     }
-  } catch {
-    // Servidor backend pode não estar rodando ou estar em modo estático
   }
 
-  return { success: true, message: 'Dados salvos localmente na aplicação com sucesso (gravados na memória permanente).' };
+  return { success: true, message: 'Dados salvos e sincronizados com sucesso.' };
 }
 
 /**

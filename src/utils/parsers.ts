@@ -271,19 +271,25 @@ export function calcularDivergencia(
   const difUnidades = invParsed.totalUnits - dispParsed.totalUnits;
   const difSkus = Math.trunc(difUnidades / factor);
   const avulsas = Math.abs(difUnidades % factor);
-  const status: 'OK' | 'SOBRA' | 'FALTA' = difUnidades === 0 ? 'OK' : difUnidades > 0 ? 'SOBRA' : 'FALTA';
+
+  // REGRA OFICIAL DE CONCILIAÇÃO AMBEV DPO:
+  // A divergência contábil, financeira e volumétrica é apurada estritamente sobre SKUs fechados (caixas/fardos inteiros).
+  // Unidades avulsas após a barra (/XX) são preservadas em diferencaRaw para auditoria operacional Promax, mas não geram falta/sobra financeira.
+  const status: 'OK' | 'SOBRA' | 'FALTA' = difSkus === 0 ? 'OK' : difSkus > 0 ? 'SOBRA' : 'FALTA';
 
   let diferencaRaw = '0/00';
   if (difUnidades !== 0) {
     const absSkus = Math.abs(difSkus);
-    const formattedLoose = String(avulsas).padStart(2, '0');
+    const padLen = factor > 100 ? String(factor - 1).length : 2;
+    const formattedLoose = String(avulsas).padStart(padLen, '0');
     diferencaRaw = `${absSkus}/${formattedLoose}${difUnidades < 0 ? '-' : ''}`;
   }
 
-  const impactoFinanceiro = difUnidades * valorUnitario;
-  const prejuizoFinanceiro = difUnidades < 0 ? Math.abs(impactoFinanceiro) : 0;
-  const sobraFinanceira = difUnidades > 0 ? impactoFinanceiro : 0;
-  const impactoHl = (difUnidades / factor) * fatorHl;
+  const valorCaixa = valorUnitario * factor;
+  const impactoFinanceiro = difSkus * valorCaixa;
+  const prejuizoFinanceiro = difSkus < 0 ? Math.abs(difSkus) * valorCaixa : 0;
+  const sobraFinanceira = difSkus > 0 ? difSkus * valorCaixa : 0;
+  const impactoHl = difSkus * fatorHl;
 
   return {
     dispParsed,
@@ -312,9 +318,10 @@ export function formatSkuUnit(totalUnits: number, fatorSku: number = 1): string 
 
   const skus = Math.floor(absUnits / factor);
   const units = absUnits % factor;
+  const padLen = factor > 100 ? String(factor - 1).length : 2;
 
   const formattedSkus = skus.toLocaleString('pt-BR');
-  const formattedUnits = String(units).padStart(2, '0');
+  const formattedUnits = String(units).padStart(padLen, '0');
 
   return `${isNeg ? '-' : ''}${formattedSkus}/${formattedUnits}`;
 }
@@ -332,9 +339,10 @@ export function formatPromaxSkuDiff(totalUnits: number, fatorSku: number = 1): s
   const absUnits = Math.abs(totalUnits);
   const skus = Math.floor(absUnits / factor);
   const units = absUnits % factor;
+  const padLen = factor > 100 ? String(factor - 1).length : 2;
 
   const formattedSkus = skus.toLocaleString('pt-BR');
-  const formattedUnits = String(units).padStart(2, '0');
+  const formattedUnits = String(units).padStart(padLen, '0');
 
   if (isNeg) {
     return `${formattedSkus}/${formattedUnits}-`;
@@ -416,46 +424,46 @@ export function extractPackFactorFromDescription(desc: string | undefined | null
     return 6;
   }
 
-  // Pattern 2: Multiplicações explícitas "1X12", "1X24", "2X12", "4X6"
+  // Pattern 2: Multiplicações explícitas "1X12", "1X24", "2X12", "4X6", "1X200"
   const mMult = d.match(/(\d+)\s*[X]\s*(\d+)/);
   if (mMult) {
     const mult = parseInt(mMult[1], 10) * parseInt(mMult[2], 10);
-    if (mult > 1 && mult <= 200) return mult;
+    if (mult > 1 && mult <= 1000) return mult;
   }
 
   // Pattern 3: "MULTPACK 12" ou "MULTIPACK 12" ou "MULTPACK 15"
   const mMultPack = d.match(/MULT(?:I)?PACK\s*(\d+)/);
   if (mMultPack) {
     const n = parseInt(mMultPack[1], 10);
-    if (n > 1 && n <= 100) return n;
+    if (n > 1 && n <= 1000) return n;
   }
 
-  // Pattern 4: "CX/12", "CX/24", "CX/6", "CX/8", "CX/15", "CX/23", "CX/4", "CX/36", "CX/60", "CX/100", "CX24", "CX12"
+  // Pattern 4: "CX/12", "CX/24", "CX/6", "CX/60", "CX/100", "CX200", "CX24", "CX12"
   const mCx = d.match(/(?:CX\/|CX\s*\/\s*|CX\s*C\/?\s*|CX\s+C\s+|CX\s*C|CX\s*)(\d+)/);
   if (mCx) {
     const n = parseInt(mCx[1], 10);
-    if (n > 1 && n <= 100) return n;
+    if (n > 1 && n <= 1000) return n;
   }
 
   // Pattern 5: "SH C/12", "SH C15", "SH C/04", "SH C/6", "SHRINK C/6", "SH C 12", "SH12", "SH15"
   const mSh = d.match(/(?:SH\s*C\/?\s*|SHRINK\s*C\/?\s*|SH\s+C\s*|SH\s*)(\d+)/);
   if (mSh) {
     const n = parseInt(mSh[1], 10);
-    if (n > 1 && n <= 100) return n;
+    if (n > 1 && n <= 1000) return n;
   }
 
-  // Pattern 6: "CAIXA C/12", "CAIXA C/6", "CAIXA C/8", "FD C/6", "FARDO C/6", "DSP C/24", "DISPLAY C/24", "GARRAFEIRA C/24", "POTE C/40", "PT/50", "PT/40"
-  const mCx2 = d.match(/(?:CAIXA\s+C\/?\s*|FD\s+C\/?\s*|FARDO\s+C\/?\s*|DSP\s+C\/?\s*|DISPLAY\s+C\/?\s*|GARRAFEIRA\s+C\/?\s*|POTE\s+C\/?\s*|PT\/?\s*)(\d+)/);
+  // Pattern 6: "CAIXA C/12", "FD C/6", "FD/36", "FARDO C/6", "DSP C/24", "DISPLAY C/24", "GARRAFEIRA C/24", "POTE C/40", "PT/50"
+  const mCx2 = d.match(/(?:CAIXA\s+C\/?\s*|FD\s+C\/?\s*|FD\/?\s*|FARDO\s+C\/?\s*|DSP\s+C\/?\s*|DSP\/?\s*|DISPLAY\s+C\/?\s*|GARRAFEIRA\s+C\/?\s*|POTE\s+C\/?\s*|PT\/?\s*)(\d+)/);
   if (mCx2) {
     const n = parseInt(mCx2[1], 10);
-    if (n > 1 && n <= 100) return n;
+    if (n > 1 && n <= 1000) return n;
   }
 
-  // Pattern 7: "C/12", "C/24", "C/6", "C24", "C12", "C6", "C10", "C15", "C20", "C21", "C27", "C30", "C36", "C40", "C48", "C50", "C60" genérico
-  const mGeneric = d.match(/\bC\/?\s*(\d{1,3})\b/);
+  // Pattern 7: "C/12", "C/24", "C/100", "C/200", "C24", "C48", "C50", "C60", "C200" genérico
+  const mGeneric = d.match(/\bC\/?\s*(\d{1,4})\b/);
   if (mGeneric) {
     const n = parseInt(mGeneric[1], 10);
-    if (n > 1 && n <= 100) return n;
+    if (n > 1 && n <= 1000) return n;
   }
 
   return null;
@@ -647,8 +655,10 @@ export interface Parse020502DetailedResult {
   countFalta: number;
 }
 
-// Regex estrito para validação de formato SKU/UN do Promax (ex: 387/06, 0/00, 19/00-)
-export const PROMAX_QTY_REGEX = /^\d[\d.]*\/\d{2}-?$/;
+// Regex para validação de formato SKU/UN do Promax:
+// Suporta 1 a 4 dígitos após a barra (ex: 387/06, 12/000 em itens CX100/CX200 como 31766 ASSOLAN, 19/00-, -19/00)
+// bem como quantidades inteiras (ex: 15, 0) quando o Excel suprime "/00".
+export const PROMAX_QTY_REGEX = /^-?\d[\d.]*(?:\/\d{1,4})?-?$/;
 
 const EXPLICIT_IGNORED_HEADERS = new Set([
   'diferenca congelamento',
@@ -852,15 +862,21 @@ export function parse020502CsvDetailed(
 
     dataLinesRead++;
 
-    // Validação estrita: inventario e disponivel devem seguir /^\d[\d.]*\/\d{2}-?$/
-    const rawDisp = (cols[colIndices.disponivel] || '').trim();
-    const rawInv = (cols[colIndices.inventario] || '').trim();
+    // Validação Promax (suporta /XX, /XXX para CX100/CX200 ex. 31766 ASSOLAN, inteiros e células zeradas/vazias quando a contraparte existe)
+    const rawDispCell = (cols[colIndices.disponivel] || '').trim();
+    const rawInvCell = (cols[colIndices.inventario] || '').trim();
+
+    const isDispBlank = rawDispCell === '' || rawDispCell === '-';
+    const isInvBlank = rawInvCell === '' || rawInvCell === '-';
+
+    const rawDisp = isDispBlank && !isInvBlank && PROMAX_QTY_REGEX.test(rawInvCell) ? '0/00' : rawDispCell;
+    const rawInv = isInvBlank && !isDispBlank && PROMAX_QTY_REGEX.test(rawDispCell) ? '0/00' : rawInvCell;
 
     if (!PROMAX_QTY_REGEX.test(rawDisp) || !PROMAX_QTY_REGEX.test(rawInv)) {
       rejectedLines.push({
         line: i + 1,
         raw: line,
-        reason: `Valores de Disponível ("${rawDisp}") ou Inventário ("${rawInv}") não seguem o formato Promax SKU/UN (/^\\d[\\d.]*\\/\\d{2}-?$/). Linha rejeitada.`
+        reason: `Valores de Disponível ("${rawDispCell}") ou Inventário ("${rawInvCell}") não seguem o formato Promax SKU/UN. Linha rejeitada.`
       });
       continue;
     }
@@ -914,11 +930,23 @@ export function parse020502CsvDetailed(
 
     fatorSku = Math.max(1, fatorSku);
 
-    let valorUnitario = (cols[colIndices.custoMedio] ? parseBrNumber(cols[colIndices.custoMedio]) : 0) || prodInfo?.valorUnit || 1;
-    let valorCaixa = prodInfo?.valor || (valorUnitario * fatorSku);
-    if (valorCaixa > 0 && fatorSku > 1 && (valorUnitario === valorCaixa || valorUnitario <= 0)) {
+    // Identidade contábil soberana: Custo Médio real da 02.05.02 (Promax) prevalece;
+    // valorCaixa é SEMPRE exatamente valorUnitario * fatorSku (elimina divergência entre modos/telas).
+    const parsedCm = cols[colIndices.custoMedio] ? parseBrNumber(cols[colIndices.custoMedio]) : 0;
+    let valorUnitario = 0;
+    let valorCaixa = 0;
+    if (parsedCm > 0) {
+      valorUnitario = parsedCm;
+      valorCaixa = parsedCm * fatorSku;
+    } else if (prodInfo?.valor && prodInfo.valor > 0) {
+      valorCaixa = prodInfo.valor;
       valorUnitario = valorCaixa / fatorSku;
-    } else if (valorUnitario > 0 && valorCaixa <= 0) {
+    } else if (prodInfo?.valorUnit && prodInfo.valorUnit > 0) {
+      valorUnitario = prodInfo.valorUnit;
+      valorCaixa = valorUnitario * fatorSku;
+    } else {
+      const metrics = getSkuUnitMetrics(produto, undefined, undefined, undefined, descricao);
+      valorUnitario = metrics.unitPrice > 0 ? metrics.unitPrice : 1;
       valorCaixa = valorUnitario * fatorSku;
     }
 
@@ -1130,66 +1158,33 @@ export function apply021101Recounts(
     }
 
     const newInventarioTotalUnits = rec.totalUnits;
-    const newInventarioSkus = Math.floor(newInventarioTotalUnits / item.fatorSku);
-    const newInventarioLooseUnits = newInventarioTotalUnits % item.fatorSku;
     const newInventarioRaw = formatSkuUnit(newInventarioTotalUnits, item.fatorSku);
 
-    // REGRA DE NEGÓCIO: Se saldo disponível for negativo, NÃO CONTE a diferença
-    const saldoNegativoDesconsiderado = item.disponivelTotalUnits < 0;
-
-    const dispSkus = item.disponivelSkus !== undefined ? item.disponivelSkus : Math.floor(item.disponivelTotalUnits / item.fatorSku);
-    const difSkus = newInventarioSkus - dispSkus;
-    const totalDifUnits = newInventarioTotalUnits - item.disponivelTotalUnits;
-    const difLooseUnits = newInventarioLooseUnits - (item.disponivelLooseUnits || 0);
-
-    let diferencaRaw = '0/00';
-    let status: 'OK' | 'SOBRA' | 'FALTA' = 'OK';
-    let impactoFinanceiro = 0;
-    let prejuizoFinanceiro = 0;
-    let sobraFinanceira = 0;
-    let impactoHl = 0;
-
-    if (saldoNegativoDesconsiderado) {
-      diferencaRaw = '0/00';
-      status = 'OK';
-      impactoFinanceiro = 0;
-      prejuizoFinanceiro = 0;
-      sobraFinanceira = 0;
-      impactoHl = 0;
-    } else if (difSkus === 0) {
-      // 100% Conciliado nos SKUs Fechados
-      status = 'OK';
-      diferencaRaw = '0/00';
-      impactoFinanceiro = totalDifUnits * item.valorUnitario;
-      prejuizoFinanceiro = 0;
-      sobraFinanceira = 0;
-      impactoHl = 0;
-    } else {
-      status = difSkus > 0 ? 'SOBRA' : 'FALTA';
-      diferencaRaw = formatPromaxSkuDiff(totalDifUnits, item.fatorSku);
-      impactoFinanceiro = totalDifUnits * item.valorUnitario;
-      prejuizoFinanceiro = difSkus < 0 ? Math.abs(totalDifUnits * item.valorUnitario) : 0;
-      sobraFinanceira = difSkus > 0 ? (totalDifUnits * item.valorUnitario) : 0;
-      impactoHl = (difSkus * item.fatorHl) + ((difLooseUnits / item.fatorSku) * item.fatorHl);
-    }
+    const div = calcularDivergencia(
+      item.disponivelRaw,
+      newInventarioRaw,
+      item.fatorSku,
+      item.valorUnitario,
+      item.fatorHl
+    );
 
     return {
       ...item,
       inventarioRaw: newInventarioRaw,
-      inventarioSkus: newInventarioSkus,
-      inventarioLooseUnits: newInventarioLooseUnits,
-      inventarioTotalUnits: newInventarioTotalUnits,
-      diferencaTotalUnits: totalDifUnits,
-      diferencaSkus: difSkus,
-      diferencaLooseUnits: Math.abs(difLooseUnits),
-      diferencaRaw,
-      status,
-      impactoFinanceiro,
-      prejuizoFinanceiro,
-      sobraFinanceira,
-      impactoHl,
+      inventarioSkus: div.invParsed.skus,
+      inventarioLooseUnits: Math.abs(div.invParsed.looseUnits),
+      inventarioTotalUnits: div.invParsed.totalUnits,
+      diferencaTotalUnits: div.difUnidades,
+      diferencaSkus: div.difSkus,
+      diferencaLooseUnits: div.avulsas,
+      diferencaRaw: div.diferencaRaw,
+      status: div.status,
+      impactoFinanceiro: div.impactoFinanceiro,
+      prejuizoFinanceiro: div.prejuizoFinanceiro,
+      sobraFinanceira: div.sobraFinanceira,
+      impactoHl: div.impactoHl,
       recontado: true,
-      saldoNegativoDesconsiderado,
+      saldoNegativoDesconsiderado: div.saldoNegativoDesconsiderado,
       dataAtualizacao: new Date().toLocaleDateString('pt-BR'),
     };
   });
@@ -1764,8 +1759,11 @@ export function parseFaltasCsv(
     const quantidadeUnidades = Math.round(quantidade * fatorSku);
     
     let valorTotal = cols[4] ? parseBrNumber(cols[4]) : 0;
-    if (valorTotal <= 0) {
-      valorTotal = quantidadeUnidades * valorUnit;
+    if (isNaN(valorTotal) || valorTotal <= 0) {
+      valorTotal = quantidadeSkus > 0 ? (quantidadeSkus * boxPrice) : (quantidadeUnidades * valorUnit);
+      if (valorTotal <= 0) {
+        valorTotal = quantidade * (boxPrice > 0 ? boxPrice : 50.00);
+      }
     }
     const volumeHl = quantidadeUnidades * fatorHl;
 
@@ -1885,11 +1883,28 @@ export function healStockPositionItem(
 
   fatorSku = Math.max(1, fatorSku);
 
-  let valorCaixa = item.valorCaixa || prodInfo?.valor || 0;
-  let valorUnitario = item.valorUnitario || prodInfo?.valorUnit || 0;
-  if (valorCaixa > 0 && fatorSku > 1 && (valorUnitario === valorCaixa || valorUnitario <= 0)) {
+  // Cura de identidade contábil: garante valorCaixa === valorUnitario * fatorSku em 100% dos itens persistidos,
+  // priorizando o Custo Médio real importado da 02.05.02 (custoMedio / valorUnitario) sobre preços estáticos de catálogo.
+  let valorUnitario = 0;
+  let valorCaixa = 0;
+  if (item.custoMedio && item.custoMedio > 0) {
+    valorUnitario = item.custoMedio;
+    valorCaixa = valorUnitario * fatorSku;
+  } else if (item.valorUnitario && item.valorUnitario > 0 && (!item.valorCaixa || item.valorCaixa !== item.valorUnitario || fatorSku === 1)) {
+    valorUnitario = item.valorUnitario;
+    valorCaixa = valorUnitario * fatorSku;
+  } else if (item.valorCaixa && item.valorCaixa > 0) {
+    valorCaixa = item.valorCaixa;
     valorUnitario = valorCaixa / fatorSku;
-  } else if (valorUnitario > 0 && valorCaixa <= 0) {
+  } else if (prodInfo?.valor && prodInfo.valor > 0) {
+    valorCaixa = prodInfo.valor;
+    valorUnitario = valorCaixa / fatorSku;
+  } else if (prodInfo?.valorUnit && prodInfo.valorUnit > 0) {
+    valorUnitario = prodInfo.valorUnit;
+    valorCaixa = valorUnitario * fatorSku;
+  } else {
+    const metrics = getSkuUnitMetrics(normalizeSku(item.produto), undefined, undefined, undefined, item.descricao);
+    valorUnitario = metrics.unitPrice > 0 ? metrics.unitPrice : 1;
     valorCaixa = valorUnitario * fatorSku;
   }
 

@@ -46,8 +46,16 @@ import { calculateSkuDeviations, matchSku } from '../utils/desviosUtils';
 import { roundSkuDown } from './DifMensalView';
 import { INITIAL_MONTHLY_DIFFERENCES_SETEMBRO_2026 } from '../data/initialFrozenData';
 import { ConfirmarGradeModal } from './ConfirmarGradeModal';
+import { TopSyncedScrollContainer } from './TopSyncedScrollContainer';
 import * as XLSX from 'xlsx';
-import { persistData, STORAGE_KEYS } from '../utils/persistentStorage';
+import {
+  persistData,
+  STORAGE_KEYS,
+  markLocalDatasetMutation,
+  getLocalSyncMeta,
+} from '../utils/persistentStorage';
+import { saveGradePositionsToFirestore } from '../services/firebaseSyncService';
+import { saveToCodeStorage } from '../services/codeStorageService';
 
 interface GradeEstoqueViewProps {
   stockPositions: StockPositionItem[];
@@ -103,6 +111,7 @@ export const GradeEstoqueView: React.FC<GradeEstoqueViewProps> = ({
   const [showExportMenu, setShowExportMenu] = useState<boolean>(false);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [showConfirmarModal, setShowConfirmarModal] = useState<boolean>(false);
+  const [showCopyConfirmModal, setShowCopyConfirmModal] = useState<boolean>(false);
   const [isUploading, setIsUploading] = useState(false);
 
   // Histórico/Timestamp da 02.05.02 da Grade
@@ -123,20 +132,27 @@ export const GradeEstoqueView: React.FC<GradeEstoqueViewProps> = ({
       showToast('Não há posições de estoque na Conciliação para copiar.', 'error');
       return;
     }
-    const confirmed = window.confirm(
-      `Deseja carregar as ${generalStockPositions.length} posições da 02.05.02 para a Grade de Estoque? ` +
-      `A base anterior da Grade será substituída integralmente por estas posições vigentes.`
-    );
-    if (!confirmed) return;
+    setShowCopyConfirmModal(true);
+  };
 
-    setStockPositions([...generalStockPositions]);
+  const confirmCopyFromConciliacao = () => {
+    const nextGrade = [...generalStockPositions];
+    setStockPositions(nextGrade);
     const nowStr = new Date().toLocaleString('pt-BR');
     const label = `Sincronizado da 02.05.02 (${nowStr})`;
     setImportTimestamp(label);
     persistData(STORAGE_KEYS.GRADE_IMPORT_LABEL, label);
-    persistData(STORAGE_KEYS.GRADE_POSITIONS, generalStockPositions);
-    persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, generalStockPositions);
-    showToast(`Base da Grade substituída com ${generalStockPositions.length} itens vigentes!`);
+    persistData(STORAGE_KEYS.GRADE_POSITIONS, nextGrade);
+    persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, nextGrade);
+    const stamp = markLocalDatasetMutation('gradePositions', nextGrade.length);
+    saveGradePositionsToFirestore(nextGrade, { updatedAt: stamp.updatedAt }).catch(() => {});
+    saveToCodeStorage({
+      type: 'grade',
+      gradeStockPositions: nextGrade,
+      syncMeta: getLocalSyncMeta(),
+    });
+    setShowCopyConfirmModal(false);
+    showToast(`Base da Grade substituída com ${nextGrade.length} itens vigentes!`);
   };
 
   // Mapa de faltas apuradas na data do último congelamento da DIF MENSAL (não na Dif Diária)
@@ -696,6 +712,13 @@ export const GradeEstoqueView: React.FC<GradeEstoqueViewProps> = ({
       persistData(STORAGE_KEYS.GRADE_IMPORT_LABEL, label);
       persistData(STORAGE_KEYS.GRADE_POSITIONS, parsed);
       persistData(STORAGE_KEYS.GRADE_POSITIONS_LEGACY, parsed);
+      const stamp = markLocalDatasetMutation('gradePositions', parsed.length);
+      saveGradePositionsToFirestore(parsed, { updatedAt: stamp.updatedAt }).catch(() => {});
+      saveToCodeStorage({
+        type: 'grade',
+        gradeStockPositions: parsed,
+        syncMeta: getLocalSyncMeta(),
+      });
 
       showToast(`Base 02.05.02 da Grade carregada com sucesso (${parsed.length} produtos). A Grade considera apenas a 02.05.02 da conciliação sem aplicar a dif atual!`, 'success');
     } catch (err: any) {
@@ -1201,9 +1224,9 @@ export const GradeEstoqueView: React.FC<GradeEstoqueViewProps> = ({
       </div>
 
       {/* Main Table for Visual Confirmation */}
-      <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
+      <div className="bg-white border border-slate-200 rounded-2xl shadow-sm min-w-0">
+        <TopSyncedScrollContainer>
+          <table className="w-full min-w-[920px] text-left text-xs">
             <thead className="bg-slate-50/90 text-slate-600 uppercase font-bold text-[10px] tracking-wider border-b border-slate-200">
               <tr>
                 <th className="py-3 px-3 text-center w-14 whitespace-nowrap">Status</th>
@@ -1363,10 +1386,10 @@ export const GradeEstoqueView: React.FC<GradeEstoqueViewProps> = ({
               )}
             </tbody>
           </table>
-        </div>
+        </TopSyncedScrollContainer>
 
         {/* Table Footer Summary */}
-        <div className="p-3.5 bg-slate-50 border-t border-slate-200 text-slate-600 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="p-3.5 bg-slate-50 border-t border-slate-200 rounded-b-2xl text-slate-600 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center space-x-2">
             <span>
               Exibindo <strong className="text-slate-800">{filteredGradeItems.length}</strong> de <strong className="text-slate-800">{gradeItems.length}</strong> itens cadastrados
@@ -1483,6 +1506,43 @@ export const GradeEstoqueView: React.FC<GradeEstoqueViewProps> = ({
         gradeItems={gradeItems}
         modoAjuste={modoAjuste}
       />
+
+      {/* Modal de Confirmação para Copiar 02.05.02 da Conciliação */}
+      {showCopyConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-md w-full p-5 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-xl bg-teal-50 border border-teal-200 flex items-center justify-center shrink-0">
+                <RefreshCw className="w-4 h-4 text-teal-700" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">
+                  Substituir Base da Grade de Estoque?
+                </h3>
+                <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                  Deseja carregar as <strong>{generalStockPositions.length}</strong> posições vigentes da 02.05.02 para a Grade de Estoque? A base anterior da Grade será substituída integralmente e sincronizada na nuvem.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowCopyConfirmModal(false)}
+                className="px-3.5 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-semibold transition cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={confirmCopyFromConciliacao}
+                className="px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold transition cursor-pointer"
+              >
+                Confirmar e Sincronizar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );
